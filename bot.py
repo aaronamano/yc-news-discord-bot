@@ -17,7 +17,7 @@ client = discord.Client(intents=intents)
 posted_ids = set()
 
 def fetch_newest(top_n=15):
-    resp = requests.get(HN_URL, timeout=5000)
+    resp = requests.get(HN_URL, timeout=10)
     soup = BeautifulSoup(resp.text, "html.parser")
 
     items = []
@@ -41,7 +41,7 @@ def fetch_newest(top_n=15):
         })
     return items
 
-@tasks.loop(minutes=5)
+@tasks.loop(hours=1)
 async def poll_hn():
     channel = client.get_channel(CHANNEL_ID)
     if channel is None:
