@@ -4,12 +4,11 @@ import requests
 from bs4 import BeautifulSoup
 import discord
 from discord.ext import tasks
-import dotenv
-
-dotenv.load_dotenv()
+from dotenv import load_dotenv
+load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_TOKEN")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 HN_URL = "https://news.ycombinator.com/newest"
 
 intents = discord.Intents.default()
@@ -17,12 +16,12 @@ client = discord.Client(intents=intents)
 
 posted_ids = set()
 
-def fetch_newest():
-    resp = requests.get(HN_URL, timeout=10)
+def fetch_newest(top_n=15):
+    resp = requests.get(HN_URL, timeout=5000)
     soup = BeautifulSoup(resp.text, "html.parser")
 
     items = []
-    rows = soup.select("tr.athing")
+    rows = soup.select("tr.athing")[:top_n]
     for row in rows:
         item_id = row.get("id")
         title_link = row.select_one("span.titleline a")
@@ -54,9 +53,9 @@ async def poll_hn():
     # Optional: only post first N new items each cycle
     for item in reversed(new_items):  # reversed to post oldest new first
         posted_ids.add(item["id"])
-        msg = f"**{item['title']}**\n{item['url']}\nHN: {item['hn_link']} ({item['age']})"
+        msg = f"{item['hn_link']}"
         await channel.send(msg)
-        await asyncio.sleep(1)  # tiny delay to avoid rate limits
+        await asyncio.sleep(10)  # tiny delay to avoid rate limits
 
 @client.event
 async def on_ready():
