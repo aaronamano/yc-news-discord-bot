@@ -106,27 +106,7 @@ async def poll_hn():
     for item in reversed(new_items):  # reversed to post oldest new first
         posted_ids.add(item["id"])
         
-        # Fetch meta description and image for the URL
-        description, image_url = fetch_meta_data(item['url'])
-        
-        # Create embed with title only (no URL)
-        embed = discord.Embed(
-            title=item['title'],
-            description=description if description else ""
-        )
-        
-        # Add image if available
-        if image_url:
-            embed.set_image(url=image_url)
-        
-        # Add source link and HN discussion link in the description
-        source_link = item['hn_link'] if item['url'].startswith("item?id=") else item['url']
-        current_desc = embed.description or ""
-        
-        # Add clickable source link
-        embed.description = current_desc + f"\n\n{source_link}"
-        
-        await channel.send(embed=embed)
+        await channel.send(item['url'])
         await asyncio.sleep(10)  # tiny delay to avoid rate limits
 
 @client.event
