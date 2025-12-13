@@ -109,11 +109,9 @@ async def poll_hn():
         # Fetch meta description and image for the URL
         description, image_url = fetch_meta_data(item['url'])
         
-        # Create embed - use HN link for internal URLs
-        embed_url = item['hn_link'] if item['url'].startswith("item?id=") else item['url']
+        # Create embed with title only (no URL)
         embed = discord.Embed(
             title=item['title'],
-            url=embed_url,
             description=description if description else ""
         )
         
@@ -121,8 +119,12 @@ async def poll_hn():
         if image_url:
             embed.set_image(url=image_url)
         
-        # Add HN discussion link as footer
-        embed.set_footer(text=item['hn_link'])
+        # Add source link and HN discussion link in the description
+        source_link = item['hn_link'] if item['url'].startswith("item?id=") else item['url']
+        current_desc = embed.description or ""
+        
+        # Add clickable source link
+        embed.description = current_desc + f"\n\n{source_link}"
         
         await channel.send(embed=embed)
         await asyncio.sleep(10)  # tiny delay to avoid rate limits
