@@ -93,7 +93,7 @@ def fetch_newest(top_n=15):
         })
     return items
 
-@tasks.loop(hours=1)
+@tasks.loop(minutes=30)
 async def poll_hn():
     channel = client.get_channel(CHANNEL_ID)
     if channel is None:
@@ -127,7 +127,7 @@ async def poll_hn():
         embed.description = current_desc + f"\n\n{source_link}"
         
         await channel.send(embed=embed)
-        await asyncio.sleep(10)  # tiny delay to avoid rate limits
+        await asyncio.sleep(1)  # tiny delay to avoid rate limits
 
 @client.event
 async def on_ready():
