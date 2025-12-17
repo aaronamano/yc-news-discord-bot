@@ -95,39 +95,52 @@ def fetch_newest(top_n=15):
 
 @tasks.loop(minutes=30)
 async def poll_hn():
-    channel = client.get_channel(CHANNEL_ID)
-    if channel is None:
-        return
+    try:
+        channel = client.get_channel(CHANNEL_ID)
+        if channel is None:
+            print("Channel is None – check CHANNEL_ID")
+            return
 
-    items = fetch_newest()
-    new_items = [it for it in items if it["id"] not in posted_ids]
+        items = fetch_newest()
+        new_items = [it for it in items if it["id"] not in posted_ids]
 
-    # Optional: only post first N new items each cycle
-    for item in reversed(new_items):  # reversed to post oldest new first
-        posted_ids.add(item["id"])
+        for item in reversed(new_items):
+            posted_ids.add(item["id"])
 
-        # Fetch meta description and image for the URL
-        description, image_url = fetch_meta_data(item['url'])
-        
-        # Create embed with title only (no URL)
-        embed = discord.Embed(
-            title=item['title'],
-            description=description if description else ""
-        )
-        
-        # Add image if available
-        if image_url:
-            embed.set_image(url=image_url)
-        
-        # Add source link and HN discussion link in the description
-        source_link = item['hn_link'] if item['url'].startswith("item?id=") else item['url']
-        current_desc = embed.description or ""
-        
-        # Add clickable source link
-        embed.description = current_desc + f"\n\n{source_link}"
-        
-        await channel.send(embed=embed)
-        await asyncio.sleep(1)  # tiny delay to avoid rate limits
+            MAX_DESC_LEN = 1800  # leave headroom for links, etc.
+
+            description, image_url = fetch_meta_data(item["url"])
+            if description:
+                description = description[:MAX_DESC_LEN]
+
+            embed = discord.Embed(
+                title=item["title"],
+                description=description if description else ""
+            )
+
+            if image_url:
+                embed.set_image(url=image_url)
+
+            source_link = item["hn_link"] if item["url"].startswith("item?id=") else item["url"]
+            base_desc = description or ""
+            extra = f"\n\n{source_link}"
+
+            full_desc = (base_desc + extra)
+            if len(full_desc) > 4000:  # extra safety
+                full_desc = full_desc[:4000]
+
+            embed = discord.Embed(
+                title=item["title"][:256],  # title limit
+                description=full_desc
+            )
+
+            await channel.send(embed=embed)
+            await asyncio.sleep(1)
+    except Exception as e:
+        print(f"Error in poll_hn loop: {e}")
+
+
+
 
 @client.event
 async def on_ready():
