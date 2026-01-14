@@ -220,6 +220,7 @@ async def on_message(message):
         
         save_subscriptions(subscriptions)
         await message.author.send("✅ You have been subscribed to YC News updates!")
+        await message.channel.send(f"{message.author.mention} subscribed")
         
     elif content.startswith('!yc-news unsubscribe'):
         subscriptions = load_subscriptions()
@@ -230,6 +231,7 @@ async def on_message(message):
         
         save_subscriptions(subscriptions)
         await message.author.send("❌ You have been unsubscribed from YC News updates.")
+        await message.channel.send(f"{message.author.mention} unsubscribed")
         
     elif content.startswith('!yc-news add='):
         subscriptions = load_subscriptions()
@@ -254,7 +256,8 @@ async def on_message(message):
                 subscriptions[user_id]['tags'].append(tag)
         
         save_subscriptions(subscriptions)
-        await message.author.send(f"✅ Tags added: {', '.join(new_tags)}")
+        await message.author.send(f"✅ You added {', '.join(new_tags)}")
+        await message.channel.send(f"{message.author.mention} added \"{', '.join(new_tags)}\"")
         
     elif content.startswith('!yc-news remove='):
         subscriptions = load_subscriptions()
@@ -281,9 +284,24 @@ async def on_message(message):
         
         save_subscriptions(subscriptions)
         if removed_tags:
-            await message.author.send(f"✅ Tags removed: {', '.join(removed_tags)}")
+            await message.author.send(f"✅ You removed {', '.join(removed_tags)}")
+            await message.channel.send(f"{message.author.mention} removed {', '.join(removed_tags)}")
         else:
             await message.author.send("❌ No matching tags found.")
+            
+    elif content == '!yc-news tags':
+        subscriptions = load_subscriptions()
+        user_id = str(message.author.id)
+        
+        if user_id not in subscriptions:
+            await message.author.send("❌ You are not subscribed yet.")
+            return
+        
+        tags = subscriptions[user_id].get('tags', [])
+        if tags:
+            await message.author.send(f"📋 Your current tags are {', '.join(tags)}")
+        else:
+            await message.author.send("📋 You have no tags subscribed. Use `!yc-news add=\"AI, ML\"` to add tags.")
 
 try:
     client.run(DISCORD_TOKEN)
