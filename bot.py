@@ -3,6 +3,7 @@ import asyncio
 import requests
 import json
 import re
+import time
 from bs4 import BeautifulSoup
 import discord
 from discord.ext import tasks, commands
@@ -11,14 +12,9 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-HN_URL = "https://hn.algolia.com/?dateRange=last24h&page=0&prefix=true&sort=byDate&type=story"
-
-print(f"Token found: {bool(DISCORD_TOKEN)}")
-print(f"Channel ID: {CHANNEL_ID}")
 
 intents = discord.Intents.default()
 intents.message_content = True
-print("Setting up client...")
 client = discord.Client(intents=intents)
 
 posted_ids = set()
@@ -88,44 +84,60 @@ def fetch_meta_data(url):
         return None, None
 
 def fetch_newest(top_n=15, tags=None):
-    url = HN_URL
+    # API endpoint that powers your requested URL: 
+    # https://hn.algolia.com/?dateRange=last24h&page=0&prefix=true&sort=byDate&type=story
+    api_url = "https://hn.algolia.com/api/v1/search"
+    
+    # Parameters that match your URL requirements
+    params = {
+        'tags': 'story',  # type=story
+        'hitsPerPage': top_n
+    }
+    
+    # Handle dateRange=last24h
+    twenty_four_hours_ago = int(time.time()) - 86400
+    params['numericFilters'] = f'created_at_i>{twenty_four_hours_ago}'
+    
+    # Handle query tags - integrates tags with URL as specified
+    # When users add tags like "AI, ML, LLMs", each word is parsed and added to the URL
+    # This corresponds to &query=AI&query=ML&query=LLMs in the base URL
+    # For the API, we combine them into a single query string
     if tags:
-        for tag in tags:
-            url += f"&query={tag}"
+        params['query'] = ' '.join(tags)
     
-    resp = requests.get(url, timeout=10)
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    items = []
-    stories = soup.select("div.SearchResult")
-    
-    for story in stories[:top_n]:
-        title_link = story.select_one("a.TitleLink")
-        if not title_link:
-            continue
-            
-        title = title_link.text.strip()
-        story_url = title_link.get("href", "#")
+    try:
+        resp = requests.get(api_url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
         
-        meta_info = story.select_one("div.SearchResult__meta")
-        if meta_info:
-            hn_link = meta_info.select_one("a")
-            hn_url = hn_link.get("href") if hn_link else "#"
-            item_id = hn_url.split("id=")[-1] if "id=" in hn_url else str(len(items))
-        else:
-            hn_url = "#"
-            item_id = str(len(items))
+        items = []
+        for hit in data.get('hits', []):
+            title = hit.get('title', 'No title')
+            story_url = hit.get('url', '')
+            if not story_url:
+                story_url = hit.get('story_url', '')
+            
+            object_id = hit.get('objectID', str(len(items)))
+            hn_link = f"https://news.ycombinator.com/item?id={object_id}"
+            
+            # Convert timestamp to readable age
+            created_at = hit.get('created_at', 'recent')
+            
+            items.append({
+                "id": object_id,
+                "title": title,
+                "url": story_url,
+                "hn_link": hn_link,
+                "age": created_at,
+            })
+        
+        return items
+        
+    except Exception as e:
+        print(f"Error fetching from Algolia: {e}")
+        return []
 
-        items.append({
-            "id": item_id,
-            "title": title,
-            "url": story_url,
-            "hn_link": hn_url,
-            "age": "recent",
-        })
-    return items
-
-@tasks.loop(minutes=60)
+@tasks.loop(hours=2)
 async def poll_hn():
     try:
         subscriptions = load_subscriptions()
