@@ -1,20 +1,39 @@
 import os
 import asyncio
 import requests
+import json
+import re
 from bs4 import BeautifulSoup
 import discord
-from discord.ext import tasks
+from discord.ext import tasks, commands
 from dotenv import load_dotenv
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-HN_URL = "https://news.ycombinator.com/newest"
+HN_URL = "https://hn.algolia.com/?dateRange=last24h&page=0&prefix=true&sort=byDate&type=story"
+
+print(f"Token found: {bool(DISCORD_TOKEN)}")
+print(f"Channel ID: {CHANNEL_ID}")
 
 intents = discord.Intents.default()
+intents.message_content = True
+print("Setting up client...")
 client = discord.Client(intents=intents)
 
 posted_ids = set()
+SUBSCRIPTIONS_FILE = 'subscriptions.json'
+
+def load_subscriptions():
+    try:
+        with open(SUBSCRIPTIONS_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_subscriptions(subscriptions):
+    with open(SUBSCRIPTIONS_FILE, 'w') as f:
+        json.dump(subscriptions, f, indent=2)
 
 def fetch_meta_data(url):
     """Fetch meta description and image from a URL"""
@@ -68,74 +87,93 @@ def fetch_meta_data(url):
         print(f"Error fetching meta data for {url}: {e}")
         return None, None
 
-def fetch_newest(top_n=15):
-    resp = requests.get(HN_URL, timeout=10)
+def fetch_newest(top_n=15, tags=None):
+    url = HN_URL
+    if tags:
+        for tag in tags:
+            url += f"&query={tag}"
+    
+    resp = requests.get(url, timeout=10)
     soup = BeautifulSoup(resp.text, "html.parser")
 
     items = []
-    rows = soup.select("tr.athing")[:top_n]
-    for row in rows:
-        item_id = row.get("id")
-        title_link = row.select_one("span.titleline a")
-        title = title_link.text if title_link else "No title"
-        url = title_link["href"] if title_link else "#"
-        hn_link = f"https://news.ycombinator.com/item?id={item_id}"
-
-        subtext = row.find_next_sibling("tr").select_one("td.subtext")
-        age = subtext.select_one("span.age").text if subtext else "unknown"
+    stories = soup.select("div.SearchResult")
+    
+    for story in stories[:top_n]:
+        title_link = story.select_one("a.TitleLink")
+        if not title_link:
+            continue
+            
+        title = title_link.text.strip()
+        story_url = title_link.get("href", "#")
+        
+        meta_info = story.select_one("div.SearchResult__meta")
+        if meta_info:
+            hn_link = meta_info.select_one("a")
+            hn_url = hn_link.get("href") if hn_link else "#"
+            item_id = hn_url.split("id=")[-1] if "id=" in hn_url else str(len(items))
+        else:
+            hn_url = "#"
+            item_id = str(len(items))
 
         items.append({
             "id": item_id,
             "title": title,
-            "url": url,
-            "hn_link": hn_link,
-            "age": age,
+            "url": story_url,
+            "hn_link": hn_url,
+            "age": "recent",
         })
     return items
 
-@tasks.loop(minutes=30)
+@tasks.loop(minutes=60)
 async def poll_hn():
     try:
-        channel = client.get_channel(CHANNEL_ID)
-        if channel is None:
-            print("Channel is None – check CHANNEL_ID")
-            return
+        subscriptions = load_subscriptions()
+        
+        for user_id, user_data in subscriptions.items():
+            if not user_data.get('subscribed', False):
+                continue
+                
+            tags = user_data.get('tags', [])
+            items = fetch_newest(15, tags)
+            new_items = [it for it in items if it["id"] not in posted_ids]
 
-        items = fetch_newest()
-        new_items = [it for it in items if it["id"] not in posted_ids]
+            if not new_items:
+                continue
 
-        for item in reversed(new_items):
-            posted_ids.add(item["id"])
+            user = await client.fetch_user(int(user_id))
+            if not user:
+                continue
 
-            MAX_DESC_LEN = 1800  # leave headroom for links, etc.
+            for item in reversed(new_items[:5]):  # Limit to 5 items per user per hour
+                posted_ids.add(item["id"])
 
-            description, image_url = fetch_meta_data(item["url"])
-            if description:
-                description = description[:MAX_DESC_LEN]
+                description, image_url = fetch_meta_data(item["url"])
+                if description:
+                    description = description[:1800]
 
-            embed = discord.Embed(
-                title=item["title"],
-                description=description if description else ""
-            )
+                source_link = item["hn_link"] if item["url"].startswith("item?id=") else item["url"]
+                base_desc = description or ""
+                extra = f"\n\n{source_link}"
 
-            if image_url:
-                embed.set_image(url=image_url)
+                full_desc = (base_desc + extra)
+                if len(full_desc) > 4000:
+                    full_desc = full_desc[:4000]
 
-            source_link = item["hn_link"] if item["url"].startswith("item?id=") else item["url"]
-            base_desc = description or ""
-            extra = f"\n\n{source_link}"
+                embed = discord.Embed(
+                    title=item["title"][:256],
+                    description=full_desc
+                )
 
-            full_desc = (base_desc + extra)
-            if len(full_desc) > 4000:  # extra safety
-                full_desc = full_desc[:4000]
+                if image_url:
+                    embed.set_image(url=image_url)
 
-            embed = discord.Embed(
-                title=item["title"][:256],  # title limit
-                description=full_desc
-            )
-
-            await channel.send(embed=embed)
-            await asyncio.sleep(1)
+                try:
+                    await user.send(embed=embed)
+                    await asyncio.sleep(1)
+                except discord.Forbidden:
+                    print(f"Cannot send DM to user {user_id}")
+                    
     except Exception as e:
         print(f"Error in poll_hn loop: {e}")
 
@@ -146,5 +184,100 @@ async def poll_hn():
 async def on_ready():
     print(f"Logged in as {client.user}")
     poll_hn.start()
+    print("Bot is running. Press Ctrl+C to stop.")
 
-client.run(DISCORD_TOKEN)
+@client.event
+async def on_message(message):
+    if message.author == client.user:
+        return
+    
+    # Only allow commands in the specified channel
+    if message.channel.id != CHANNEL_ID:
+        return
+    
+    content = message.content.strip()
+    
+    if content.startswith('!yc-news subscribe'):
+        subscriptions = load_subscriptions()
+        user_id = str(message.author.id)
+        
+        if user_id not in subscriptions:
+            subscriptions[user_id] = {'subscribed': True, 'tags': []}
+        else:
+            subscriptions[user_id]['subscribed'] = True
+        
+        save_subscriptions(subscriptions)
+        await message.author.send("✅ You have been subscribed to YC News updates!")
+        
+    elif content.startswith('!yc-news unsubscribe'):
+        subscriptions = load_subscriptions()
+        user_id = str(message.author.id)
+        
+        if user_id in subscriptions:
+            subscriptions[user_id]['subscribed'] = False
+        
+        save_subscriptions(subscriptions)
+        await message.author.send("❌ You have been unsubscribed from YC News updates.")
+        
+    elif content.startswith('!yc-news add='):
+        subscriptions = load_subscriptions()
+        user_id = str(message.author.id)
+        
+        if user_id not in subscriptions:
+            subscriptions[user_id] = {'subscribed': True, 'tags': []}
+        
+        tags_str = content.split('=', 1)[1].strip()
+        if tags_str.startswith('"') and tags_str.endswith('"'):
+            tags_str = tags_str[1:-1]
+        
+        new_tags = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
+        
+        if user_id not in subscriptions:
+            subscriptions[user_id] = {'subscribed': True, 'tags': []}
+        if 'tags' not in subscriptions[user_id]:
+            subscriptions[user_id]['tags'] = []
+            
+        for tag in new_tags:
+            if tag not in subscriptions[user_id]['tags']:
+                subscriptions[user_id]['tags'].append(tag)
+        
+        save_subscriptions(subscriptions)
+        await message.author.send(f"✅ Tags added: {', '.join(new_tags)}")
+        
+    elif content.startswith('!yc-news remove='):
+        subscriptions = load_subscriptions()
+        user_id = str(message.author.id)
+        
+        if user_id not in subscriptions:
+            await message.author.send("❌ You are not subscribed yet.")
+            return
+        
+        tags_str = content.split('=', 1)[1].strip()
+        if tags_str.startswith('"') and tags_str.endswith('"'):
+            tags_str = tags_str[1:-1]
+        
+        tags_to_remove = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
+        
+        if 'tags' not in subscriptions[user_id]:
+            subscriptions[user_id]['tags'] = []
+            
+        removed_tags = []
+        for tag in tags_to_remove:
+            if tag in subscriptions[user_id]['tags']:
+                subscriptions[user_id]['tags'].remove(tag)
+                removed_tags.append(tag)
+        
+        save_subscriptions(subscriptions)
+        if removed_tags:
+            await message.author.send(f"✅ Tags removed: {', '.join(removed_tags)}")
+        else:
+            await message.author.send("❌ No matching tags found.")
+
+try:
+    client.run(DISCORD_TOKEN)
+except discord.errors.LoginFailure:
+    print("Error: Invalid Discord token. Please check your DISCORD_TOKEN in .env file.")
+except KeyboardInterrupt:
+    print("\nBot stopped by user.")
+except Exception as e:
+    print(f"Error starting bot: {e}")
