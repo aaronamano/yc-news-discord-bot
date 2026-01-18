@@ -73,7 +73,7 @@ Run these commands in the specified Discord channel (configured via `CHANNEL_ID`
 ```
 yc-news-discord-bot/
 ├── bot.py                 # Main bot implementation
-├── subscriptions.json     # User subscriptions and tags (auto-created)
+├── subscriptions.db       # SQLite database for user subscriptions and tags (auto-created)
 ├── .env                   # Environment variables (DISCORD_TOKEN, CHANNEL_ID)
 ├── .env.example           # Example environment file
 ├── requirements.txt       # Python dependencies
@@ -85,5 +85,15 @@ yc-news-discord-bot/
 - **Data Source**: [Hacker News via Algolia API](https://hn.algolia.com/?dateRange=last24h&page=0&prefix=true&sort=byDate&type=story)
 - **Scraping Frequency**: Every hour
 - **Story Limit**: Top 15 most recent stories, 5 delivered per user
-- **Storage**: Local JSON file for subscriptions and user preferences
+- **Storage**: SQLite database for subscriptions and user preferences
 - **Rate Limiting**: Built-in spam protection (5 stories/user/hour)
+
+## Database Schema
+
+```sql
+CREATE TABLE subscriptions (
+    userId TEXT PRIMARY KEY,
+    subscribed BOOLEAN DEFAULT FALSE,
+    tags TEXT DEFAULT '[]'
+)
+```

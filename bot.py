@@ -4,6 +4,7 @@ import requests
 import json
 import re
 import time
+import sqlite3
 from bs4 import BeautifulSoup
 import discord
 from discord.ext import tasks, commands
@@ -18,18 +19,53 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 posted_ids = set()
-SUBSCRIPTIONS_FILE = 'subscriptions.json'
+DB_NAME = 'subscriptions.db'
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            userId TEXT PRIMARY KEY,
+            subscribed BOOLEAN DEFAULT FALSE,
+            tags TEXT DEFAULT '[]'
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_connection():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def load_subscriptions():
-    try:
-        with open(SUBSCRIPTIONS_FILE, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM subscriptions')
+    rows = cursor.fetchall()
+    conn.close()
+    
+    subscriptions = {}
+    for row in rows:
+        subscriptions[row['userId']] = {
+            'subscribed': bool(row['subscribed']),
+            'tags': json.loads(row['tags']) if row['tags'] else []
+        }
+    return subscriptions
 
 def save_subscriptions(subscriptions):
-    with open(SUBSCRIPTIONS_FILE, 'w') as f:
-        json.dump(subscriptions, f, indent=2)
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    for user_id, user_data in subscriptions.items():
+        cursor.execute('''
+            INSERT OR REPLACE INTO subscriptions (userId, subscribed, tags)
+            VALUES (?, ?, ?)
+        ''', (user_id, user_data['subscribed'], json.dumps(user_data['tags'])))
+    
+    conn.commit()
+    conn.close()
 
 def fetch_meta_data(url):
     """Fetch meta description and image from a URL"""
@@ -137,7 +173,7 @@ def fetch_newest(top_n=15, tags=None):
         print(f"Error fetching from Algolia: {e}")
         return []
 
-@tasks.loop(hours=2)
+@tasks.loop(hours=1)
 async def poll_hn():
     try:
         subscriptions = load_subscriptions()
@@ -194,6 +230,7 @@ async def poll_hn():
 
 @client.event
 async def on_ready():
+    init_db()
     print(f"Logged in as {client.user}")
     poll_hn.start()
     print("Bot is running. Press Ctrl+C to stop.")
