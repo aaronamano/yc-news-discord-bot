@@ -1,3 +1,15 @@
+"""
+@TODO: 1/21/26
+From Aaron:
+'hey cuz im gonna be pretty busy but i want you to implement status messages for edge cases, 
+like if the user adds a tag but they're unsubscribed, they should get a message saying that 
+they haven't subscribed yet.
+
+also i want you to implement a command called !yc-news status to see if they're subscribed 
+or unsubscribed. note that i implemented sqlite and also create another remote branch 
+for this feature and make a pr.'
+"""
+
 import os
 import asyncio
 import requests
@@ -66,6 +78,12 @@ def save_subscriptions(subscriptions):
     
     conn.commit()
     conn.close()
+
+def get_user_subscription_status(user_id, subscriptions):
+    """Check if a user exists and is subscribed. Returns (exists, is_subscribed)"""
+    exists = user_id in subscriptions
+    is_subscribed = exists and subscriptions[user_id].get('subscribed', False)
+    return exists, is_subscribed
 
 def fetch_meta_data(url):
     """Fetch meta description and image from a URL"""
@@ -273,6 +291,12 @@ async def on_message(message):
     elif content.startswith('!yc-news add='):
         subscriptions = load_subscriptions()
         user_id = str(message.author.id)
+        
+        exists, is_subscribed = get_user_subscription_status(user_id, subscriptions)
+        if not exists or not is_subscribed:
+            await message.author.send("❌ You are not subscribed yet. Please type `!yc-news subscribe` first.")
+            await message.channel.send(f"{message.author.mention} tried to add tags but is not subscribed")
+            return
         
         if user_id not in subscriptions:
             subscriptions[user_id] = {'subscribed': True, 'tags': []}
