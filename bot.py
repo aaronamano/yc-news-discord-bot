@@ -303,71 +303,99 @@ async def poll_hn():
         subscriptions = await load_subscriptions()
         print(f"Starting hourly poll for {len([s for s in subscriptions.values() if s.get('subscribed')])} subscribed users")
         
+        # Collect all unique tag combinations to minimize API calls
+        tag_combinations = {}
         for user_id, user_data in subscriptions.items():
             if not user_data.get('subscribed', False):
                 continue
-                
-            tags = user_data.get('tags', [])
-            items = fetch_newest(15, tags)
-            new_items = [it for it in items if it["id"] not in posted_ids]
-
-            if not new_items:
-                continue
-
-            # Add delay between user fetches to avoid rate limiting
-            await asyncio.sleep(2)
             
-            try:
-                user = await client.fetch_user(int(user_id))
-            except discord.HTTPException as e:
-                if hasattr(e, 'status') and e.status == 429:
-                    print(f"Rate limited fetching user {user_id}, skipping...")
-                    continue
-                else:
-                    raise
-                    
-            if not user:
+            tags = tuple(sorted(user_data.get('tags', [])))  # Use tuple for dict key
+            if tags not in tag_combinations:
+                tag_combinations[tags] = []
+            tag_combinations[tags].append(user_id)
+        
+        print(f"Fetching {len(tag_combinations)} unique tag combinations instead of {len(subscriptions)} individual requests")
+        
+        # Fetch items once per unique tag combination
+        all_new_items = {}
+        for tags, user_list in tag_combinations.items():
+            items = fetch_newest(10, list(tags))  # Reduced from 15 to 10
+            new_items = [it for it in items if it["id"] not in posted_ids]
+            if new_items:
+                all_new_items[tags] = new_items[:3]  # Limit to 3 items per tag combination
+                for item in new_items[:3]:
+                    posted_ids.add(item["id"])
+        
+        if not all_new_items:
+            print("No new items found")
+            return
+        
+        # Batch fetch metadata for all new items at once
+        print(f"Fetching metadata for {sum(len(items) for items in all_new_items.values())} items")
+        metadata_cache = {}
+        for tags, items in all_new_items.items():
+            for item in items:
+                if item["url"] and not item["url"].startswith("item?id="):
+                    if item["url"] not in metadata_cache:
+                        metadata_cache[item["url"]] = fetch_meta_data(item["url"])
+                        time.sleep(2)  # Delay between metadata fetches
+        
+        # Now send to users
+        for tags, user_list in tag_combinations.items():
+            if tags not in all_new_items:
                 continue
-
-            for item in reversed(new_items[:5]):  # Limit to 5 items per user per hour
-                posted_ids.add(item["id"])
-
-                # Add delay between metadata fetches to avoid rate limiting
-                await asyncio.sleep(random.uniform(1, 3))
-                description, image_url = fetch_meta_data(item["url"])
-                if description:
-                    description = description[:1800]
-
-                source_link = item["hn_link"] if item["url"].startswith("item?id=") else item["url"]
                 
-                # Always include the URL in the description
-                if description:
-                    base_desc = description
-                    extra = f"\n\n📰 **Source**: {source_link}"
-                else:
-                    # If no description was fetched, still include the URL
-                    base_desc = "No description available"
-                    extra = f"\n\n📰 **Source**: {source_link}"
-
-                full_desc = (base_desc + extra)
-                if len(full_desc) > 4000:
-                    full_desc = full_desc[:4000]
-
-                embed = discord.Embed(
-                    title=item["title"][:256],
-                    description=full_desc,
-                    url=source_link  # Make the title clickable
-                )
-
-                if image_url:
-                    embed.set_image(url=image_url)
-
+            items = all_new_items[tags]
+            
+            # Fetch users for this tag combination
+            for user_id in user_list:
                 try:
-                    await safe_send_dm(user, embed)
-                    await asyncio.sleep(3)  # Increased delay to avoid rate limiting
-                except discord.Forbidden:
-                    print(f"Cannot send DM to user {user_id}")
-                    break  # Stop trying to send to this user if DMs are forbidden
+                    user = await client.fetch_user(int(user_id))
+                    if not user:
+                        continue
+                except discord.HTTPException as e:
+                    if hasattr(e, 'status') and e.status == 429:
+                        print(f"Rate limited fetching user {user_id}, skipping...")
+                        continue
+                    else:
+                        raise
+                
+                # Send items to this user
+                for item in items:
+                    description, image_url = metadata_cache.get(item["url"], (None, None))
+                    if description:
+                        description = description[:1800]
+
+                    source_link = item["hn_link"] if item["url"].startswith("item?id=") else item["url"]
+                    
+                    # Always include the URL in the description
+                    if description:
+                        base_desc = description
+                        extra = f"\n\n📰 **Source**: {source_link}"
+                    else:
+                        # If no description was fetched, still include the URL
+                        base_desc = "No description available"
+                        extra = f"\n\n📰 **Source**: {source_link}"
+
+                    full_desc = (base_desc + extra)
+                    if len(full_desc) > 4000:
+                        full_desc = full_desc[:4000]
+
+                    embed = discord.Embed(
+                        title=item["title"][:256],
+                        description=full_desc,
+                        url=source_link  # Make the title clickable
+                    )
+
+                    if image_url:
+                        embed.set_image(url=image_url)
+
+                    try:
+                        await safe_send_dm(user, embed)
+                        await asyncio.sleep(5)  # Increased delay between DMs
+                    except discord.Forbidden:
+                        print(f"Cannot send DM to user {user_id}")
+                        break  # Stop trying to send to this user if DMs are forbidden
                     
     except Exception as e:
         print(f"Error in poll_hn loop: {e}")
