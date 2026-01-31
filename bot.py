@@ -399,9 +399,9 @@ async def poll_hn():
                     try:
                         await safe_send_dm(user, embed)
                         await asyncio.sleep(5)  # Increased delay between DMs
-                except discord.Forbidden:
-                    print(f"Cannot send DM to user {user_id}")
-                    break  # Stop trying to send to this user if DMs are forbidden
+                    except discord.Forbidden:
+                        print(f"Cannot send DM to user {user_id}")
+                        break  # Stop trying to send to this user if DMs are forbidden
         
         print("=== poll_hn loop completed successfully ===")
                     
