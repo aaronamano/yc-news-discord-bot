@@ -17,6 +17,11 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
+# Connection state tracking
+connection_attempts = 0
+last_connection_time = 0
+MAX_RETRIES = 5
+
 posted_ids = set()
 DB_NAME = os.path.join(os.getenv('DATA_DIR', '/data'), 'subscriptions.db')
 
@@ -71,6 +76,8 @@ def save_subscriptions(subscriptions):
 
 import time
 import random
+import signal
+import sys
 
 def fetch_meta_data(url):
     """Fetch meta description and image from a URL with retry logic"""
@@ -325,6 +332,66 @@ async def on_ready():
     print("Bot is running. Press Ctrl+C to stop.")
 
 @client.event
+async def on_disconnect():
+    """Handle disconnection and clean up sessions"""
+    print("Bot disconnected, cleaning up...")
+    if poll_hn.is_running():
+        poll_hn.stop()
+    await asyncio.sleep(1)  # Give tasks time to clean up
+
+async def start_bot_with_backoff():
+    """Start bot with exponential backoff for 429 errors"""
+    for attempt in range(MAX_RETRIES):
+        try:
+            # Add delay before first connection attempt to allow previous session to expire
+            if attempt == 0:
+                print("Waiting 10 seconds before initial connection...")
+                await asyncio.sleep(10)
+            
+            print(f"Connection attempt {attempt + 1}/{MAX_RETRIES}")
+            await client.start(DISCORD_TOKEN)
+            break  # Success, exit the loop
+            
+        except discord.HTTPException as e:
+            if hasattr(e, 'status') and e.status == 429:
+                wait_time = min(2 ** attempt, 300)  # Max 5 minutes
+                print(f"Rate limited (429), waiting {wait_time}s before retry {attempt + 1}/{MAX_RETRIES}")
+                await asyncio.sleep(wait_time)
+            else:
+                print(f"Discord HTTP error: {e}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(5)  # Brief delay before retry
+                    
+        except discord.errors.LoginFailure as e:
+            print(f"Authentication failed: {e}")
+            print("Check your DISCORD_TOKEN in environment variables")
+            break  # Don't retry auth failures
+            
+        except discord.ConnectionClosed as e:
+            print(f"Connection closed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(5)  # Brief delay before retry
+                
+        except Exception as e:
+            print(f"Connection error: {e}")
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(5)  # Brief delay before retry
+    
+    print("Max connection attempts reached. Bot will exit.")
+    await client.close()
+    sys.exit(1)
+
+def signal_handler(sig, frame):
+    """Handle graceful shutdown"""
+    print('\nGracefully shutting down...')
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        loop.create_task(client.close())
+    else:
+        asyncio.run(client.close())
+    sys.exit(0)
+
+@client.event
 async def on_message(message):
     if message.author == client.user:
         return
@@ -429,10 +496,15 @@ async def on_message(message):
         else:
             await message.author.send("📋 You have no tags subscribed. Use `!yc-news add=\"AI, ML\"` to add tags.")
 
+# Register signal handlers for graceful shutdown
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# Main execution with exponential backoff
 try:
-    client.run(DISCORD_TOKEN)
+    asyncio.run(start_bot_with_backoff())
 except discord.errors.LoginFailure:
-    print("Error: Invalid Discord token. Please check your DISCORD_TOKEN in .env file.")
+    print("Error: Invalid Discord token. Please check your DISCORD_TOKEN in environment variables.")
 except KeyboardInterrupt:
     print("\nBot stopped by user.")
 except Exception as e:
