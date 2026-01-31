@@ -3,11 +3,14 @@ import asyncio
 import requests
 import json
 import time
-import sqlite3
+import random
+import signal
+import sys
 from bs4 import BeautifulSoup
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
+from supabase import create_client, Client
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
@@ -17,92 +20,67 @@ intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
-# Connection state tracking
-connection_attempts = 0
-last_connection_time = 0
-MAX_RETRIES = 5
+# Removed complex connection tracking - using simple client.run() approach
 
 posted_ids = set()
-# Use different paths for local vs Render environments
-if os.getenv('RENDER') == 'true':
-    DB_NAME = os.path.join('/data', 'subscriptions.db')
-    print("Using Render environment with database at /data/subscriptions.db")
-else:
-    DB_NAME = 'subscriptions.db'
-    print("Using local environment with database at subscriptions.db")
 
-def init_db():
+# Supabase configuration
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("Error: SUPABASE_URL and SUPABASE_KEY environment variables are required")
+    exit(1)
+
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+print("Connected to Supabase database")
+
+async def init_db():
+    """Initialize Supabase - ensure table exists"""
     try:
-        # Ensure data directory exists
-        data_dir = os.path.dirname(DB_NAME)
-        if data_dir and data_dir != '.':
-            os.makedirs(data_dir, exist_ok=True)
-        
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                userId TEXT PRIMARY KEY,
-                subscribed BOOLEAN DEFAULT FALSE,
-                tags TEXT DEFAULT '[]'
-            )
-        ''')
-        conn.commit()
-        conn.close()
-        print(f"Database initialized successfully at {DB_NAME}")
+        # Supabase handles table creation automatically
+        print("Supabase database is ready")
     except Exception as e:
         print(f"Database initialization failed: {e}")
         raise
 
-def get_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA synchronous=NORMAL')
-    conn.execute('PRAGMA cache_size=10000')
-    return conn
-
-def load_subscriptions():
+async def load_subscriptions():
+    """Load all subscriptions from Supabase"""
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM subscriptions')
-        rows = cursor.fetchall()
-        conn.close()
+        response = supabase.table('subscriptions').select('*').execute()
+        
+        if response.data is None:
+            print("No subscriptions found or error occurred")
+            return {}
         
         subscriptions = {}
-        for row in rows:
+        for row in response.data:
             subscriptions[row['userId']] = {
                 'subscribed': bool(row['subscribed']),
                 'tags': json.loads(row['tags']) if row['tags'] else []
             }
+        print(f"Loaded {len(subscriptions)} subscriptions from Supabase")
         return subscriptions
     except Exception as e:
-        print(f"Error loading subscriptions: {e}")
+        print(f"Error loading subscriptions from Supabase: {e}")
         return {}  # Return empty dict to prevent crashes
 
-def save_subscriptions(subscriptions):
+async def save_subscriptions(subscriptions):
+    """Save all subscriptions to Supabase"""
     try:
-        conn = get_connection()
-        cursor = conn.cursor()
-        
+        # Upsert all subscription records
         for user_id, user_data in subscriptions.items():
-            cursor.execute('''
-                INSERT OR REPLACE INTO subscriptions (userId, subscribed, tags)
-                VALUES (?, ?, ?)
-            ''', (user_id, user_data['subscribed'], json.dumps(user_data['tags'])))
+            supabase.table('subscriptions').upsert({
+                'userId': user_id,
+                'subscribed': user_data['subscribed'],
+                'tags': json.dumps(user_data['tags'])
+            }).execute()
         
-        conn.commit()
-        conn.close()
-        print(f"Saved subscriptions for {len(subscriptions)} users")
+        print(f"Saved {len(subscriptions)} subscriptions to Supabase")
     except Exception as e:
-        print(f"Error saving subscriptions: {e}")
-        # Don't crash the bot, just log the error
-
-import time
-import random
-import signal
-import sys
+        print(f"Error saving subscriptions to Supabase: {e}")
+        # Don't crash bot, just log the error
 
 def fetch_meta_data(url):
     """Fetch meta description and image from a URL with retry logic"""
@@ -286,10 +264,32 @@ def fetch_newest(top_n=15, tags=None):
         print(f"Error fetching from Algolia: {e}")
         return []
 
+async def safe_send_dm(user, embed):
+    """Send DM with exponential backoff for rate limiting"""
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            await user.send(embed=embed)
+            return True
+        except discord.HTTPException as e:
+            if hasattr(e, 'status') and e.status == 429:
+                wait_time = 2 ** attempt + random.uniform(0, 1)
+                print(f"Rate limited (429), waiting {wait_time:.1f}s before retry {attempt + 1}/{max_retries}")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                raise
+        except Exception as e:
+            print(f"Error sending DM: {e}")
+            return False
+    print(f"Failed to send DM after {max_retries} attempts")
+    return False
+
 @tasks.loop(hours=1)
 async def poll_hn():
     try:
-        subscriptions = load_subscriptions()
+        subscriptions = await load_subscriptions()
+        print(f"Starting hourly poll for {len([s for s in subscriptions.values() if s.get('subscribed')])} subscribed users")
         
         for user_id, user_data in subscriptions.items():
             if not user_data.get('subscribed', False):
@@ -338,7 +338,7 @@ async def poll_hn():
                     embed.set_image(url=image_url)
 
                 try:
-                    await user.send(embed=embed)
+                    await safe_send_dm(user, embed)
                     await asyncio.sleep(1)
                 except discord.Forbidden:
                     print(f"Cannot send DM to user {user_id}")
@@ -346,12 +346,9 @@ async def poll_hn():
     except Exception as e:
         print(f"Error in poll_hn loop: {e}")
 
-
-
-
 @client.event
 async def on_ready():
-    init_db()
+    await init_db()
     print(f"Logged in as {client.user}")
     poll_hn.start()
     print("Bot is running. Press Ctrl+C to stop.")
@@ -363,50 +360,6 @@ async def on_disconnect():
     if poll_hn.is_running():
         poll_hn.stop()
     await asyncio.sleep(1)  # Give tasks time to clean up
-
-async def start_bot_with_backoff():
-    """Start bot with exponential backoff for 429 errors - only for initial connection"""
-    for attempt in range(MAX_RETRIES):
-        try:
-            # Add delay before first connection attempt to allow previous session to expire
-            if attempt == 0:
-                print("Waiting 10 seconds before initial connection...")
-                await asyncio.sleep(10)
-            
-            print(f"Connection attempt {attempt + 1}/{MAX_RETRIES}")
-            await client.start(DISCORD_TOKEN)
-            break  # Success, exit the loop
-            
-        except discord.HTTPException as e:
-            if hasattr(e, 'status') and e.status == 429:
-                wait_time = min(2 ** attempt, 300)  # Max 5 minutes
-                print(f"Rate limited (429), waiting {wait_time}s before retry {attempt + 1}/{MAX_RETRIES}")
-                await asyncio.sleep(wait_time)
-            else:
-                print(f"Discord HTTP error: {e}")
-                if attempt < MAX_RETRIES - 1:
-                    await asyncio.sleep(5)  # Brief delay before retry
-                    
-        except discord.errors.LoginFailure as e:
-            print(f"Authentication failed: {e}")
-            print("Check your DISCORD_TOKEN in environment variables")
-            break  # Don't retry auth failures
-            
-        except discord.ConnectionClosed as e:
-            print(f"Connection closed: {e}")
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(5)  # Brief delay before retry
-                
-        except Exception as e:
-            print(f"Connection error: {e}")
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(5)  # Brief delay before retry
-    
-    # Only exit if we failed to connect, not for runtime errors
-    if not client.is_ready():
-        print("Max connection attempts reached. Bot will exit.")
-        await client.close()
-        sys.exit(1)
 
 def signal_handler(sig, frame):
     """Handle graceful shutdown"""
@@ -432,7 +385,7 @@ async def on_message(message):
         
         if content.startswith('!yc-news subscribe'):
             try:
-                subscriptions = load_subscriptions()
+                subscriptions = await load_subscriptions()
                 user_id = str(message.author.id)
                 
                 if user_id not in subscriptions:
@@ -440,7 +393,7 @@ async def on_message(message):
                 else:
                     subscriptions[user_id]['subscribed'] = True
                 
-                save_subscriptions(subscriptions)
+                await save_subscriptions(subscriptions)
                 await message.author.send("✅ You have been subscribed to YC News updates!")
                 await message.channel.send(f"{message.author.mention} subscribed")
             except Exception as e:
@@ -449,13 +402,13 @@ async def on_message(message):
                 
         elif content.startswith('!yc-news unsubscribe'):
             try:
-                subscriptions = load_subscriptions()
+                subscriptions = await load_subscriptions()
                 user_id = str(message.author.id)
                 
                 if user_id in subscriptions:
                     subscriptions[user_id]['subscribed'] = False
                 
-                save_subscriptions(subscriptions)
+                await save_subscriptions(subscriptions)
                 await message.author.send("❌ You have been unsubscribed from YC News updates.")
                 await message.channel.send(f"{message.author.mention} unsubscribed")
             except Exception as e:
@@ -464,7 +417,7 @@ async def on_message(message):
                 
         elif content.startswith('!yc-news add='):
             try:
-                subscriptions = load_subscriptions()
+                subscriptions = await load_subscriptions()
                 user_id = str(message.author.id)
                 
                 if user_id not in subscriptions:
@@ -485,7 +438,7 @@ async def on_message(message):
                     if tag not in subscriptions[user_id]['tags']:
                         subscriptions[user_id]['tags'].append(tag)
                 
-                save_subscriptions(subscriptions)
+                await save_subscriptions(subscriptions)
                 await message.author.send(f"✅ You added {', '.join(new_tags)}")
                 await message.channel.send(f"{message.author.mention} added \"{', '.join(new_tags)}\"")
             except Exception as e:
@@ -494,7 +447,7 @@ async def on_message(message):
                 
         elif content.startswith('!yc-news remove='):
             try:
-                subscriptions = load_subscriptions()
+                subscriptions = await load_subscriptions()
                 user_id = str(message.author.id)
                 
                 if user_id not in subscriptions:
@@ -516,7 +469,7 @@ async def on_message(message):
                         subscriptions[user_id]['tags'].remove(tag)
                         removed_tags.append(tag)
                 
-                save_subscriptions(subscriptions)
+                await save_subscriptions(subscriptions)
                 if removed_tags:
                     await message.author.send(f"✅ You removed {', '.join(removed_tags)}")
                     await message.channel.send(f"{message.author.mention} removed {', '.join(removed_tags)}")
@@ -528,7 +481,7 @@ async def on_message(message):
                 
         elif content == '!yc-news tags':
             try:
-                subscriptions = load_subscriptions()
+                subscriptions = await load_subscriptions()
                 user_id = str(message.author.id)
                 
                 if user_id not in subscriptions:
@@ -556,9 +509,9 @@ async def on_message(message):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-# Main execution with exponential backoff
+# Main execution - simple approach
 try:
-    asyncio.run(start_bot_with_backoff())
+    client.run(DISCORD_TOKEN)
 except discord.errors.LoginFailure:
     print("Error: Invalid Discord token. Please check your DISCORD_TOKEN in environment variables.")
 except KeyboardInterrupt:
