@@ -101,10 +101,10 @@ def fetch_meta_data(url):
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ]
     
-    # Enhanced headers to look more like a real browser
+    # Enhanced headers to look more like a real browser and avoid Cloudflare detection
     base_headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9,en-GB;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
         "DNT": "1",
         "Connection": "keep-alive",
@@ -113,11 +113,14 @@ def fetch_meta_data(url):
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Site": "none",
         "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0"
+        "Cache-Control": "max-age=0",
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"macOS"',
     }
     
-    max_retries = 3
-    base_timeout = 15  # Increased from 10 to 15 seconds
+    max_retries = 5  # Increased retries for Cloudflare rate limits
+    base_timeout = 20  # Increased timeout
     
     for attempt in range(max_retries):
         try:
@@ -127,6 +130,11 @@ def fetch_meta_data(url):
             
             # Exponential backoff for timeout
             timeout = base_timeout * (2 ** attempt)
+            
+            # Add random delay between requests to avoid pattern detection
+            if attempt > 0:
+                delay = random.uniform(1, 3)
+                time.sleep(delay)
             
             response = requests.get(url, timeout=timeout, headers=headers)
             response.raise_for_status()
@@ -172,17 +180,18 @@ def fetch_meta_data(url):
                 
         except requests.exceptions.HTTPError as e:
             status_code = e.response.status_code
-            if status_code == 403:
-                # Try one more time with a different user agent for 403 errors
+            if status_code in [403, 429]:
+                # Handle Cloudflare rate limits and forbidden errors with longer delays
                 if attempt < max_retries - 1:
-                    print(f"403 Forbidden for {url}, retry {attempt + 1}/{max_retries} with different user agent")
-                    time.sleep(2)
+                    wait_time = (3 ** attempt) + random.uniform(2, 5)  # Longer backoff for 403/429
+                    print(f"HTTP {status_code} (likely Cloudflare) for {url}, retry {attempt + 1}/{max_retries} after {wait_time:.1f}s")
+                    time.sleep(wait_time)
                     continue
                 else:
-                    print(f"403 Forbidden error fetching meta data for {url}")
+                    print(f"HTTP {status_code} error fetching meta data for {url}")
                     return None, None
             elif status_code in [404, 410]:
-                # Don't retry for client errors (except 403)
+                # Don't retry for client errors (except 403/429)
                 print(f"Client error {status_code} for {url}: {e}")
                 return None, None
             else:
@@ -233,6 +242,8 @@ def fetch_newest(top_n=15, tags=None):
         params['query'] = ' '.join(tags)
     
     try:
+        # Add delay to avoid rate limiting the Algolia API
+        time.sleep(random.uniform(0.5, 1.5))
         resp = requests.get(api_url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
@@ -321,6 +332,8 @@ async def poll_hn():
             for item in reversed(new_items[:5]):  # Limit to 5 items per user per hour
                 posted_ids.add(item["id"])
 
+                # Add delay between metadata fetches to avoid rate limiting
+                await asyncio.sleep(random.uniform(1, 3))
                 description, image_url = fetch_meta_data(item["url"])
                 if description:
                     description = description[:1800]
