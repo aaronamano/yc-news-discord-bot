@@ -25,6 +25,9 @@ if not CHANNEL_ID:
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.guilds = True
+intents.messages = True
+intents.dm_messages = True
 client = discord.Client(intents=intents)
 
 # Removed complex connection tracking - using simple client.run() approach
@@ -410,6 +413,17 @@ async def poll_hn():
 
 @client.event
 async def on_ready():
+    print(f"Bot logged in as: {client.user}")
+    print(f"Bot is in {len(client.guilds)} guilds")
+    print(f"Target channel ID: {CHANNEL_ID}")
+    
+    # List available channels to help debug
+    for guild in client.guilds:
+        print(f"Guild: {guild.name}")
+        for channel in guild.text_channels:
+            if channel.id == CHANNEL_ID:
+                print(f"  -> Found target channel: #{channel.name}")
+    
     await init_db()
     
     # Start health monitoring
@@ -417,6 +431,7 @@ async def on_ready():
     
     # Start polling
     poll_hn.start()
+    print("Bot setup complete")
 
 @client.event
 async def on_disconnect():
@@ -465,11 +480,12 @@ async def on_message(message):
             return
         
         # Debug: log message reception
-        if message.channel.id == CHANNEL_ID:
-            print(f"Received message: {message.content.strip()[:50]}...")
+        print(f"Message received in channel {message.channel.id} (target: {CHANNEL_ID})")
+        print(f"Message content: {message.content.strip()[:50]}...")
         
         # Only allow commands in the specified channel
         if message.channel.id != CHANNEL_ID:
+            print("Message ignored - wrong channel")
             return
         
         content = message.content.strip()
@@ -606,12 +622,13 @@ def is_cloudflare_block_error(error_text):
 
 async def start_bot_with_retry():
     """Start bot with intelligent retry logic for Cloudflare blocks"""
-    max_retries = 10
+    max_retries = 3
     base_delay = 60  # Start with 1 minute
-    max_delay = 3600  # Max 1 hour wait
+    max_delay = 1800  # Max 30 minutes wait
     
     for attempt in range(max_retries):
         try:
+            print(f"Attempting to start bot (attempt {attempt + 1}/{max_retries})")
             await client.start(DISCORD_TOKEN, reconnect=True)
             return  # Success, exit function
             
@@ -623,6 +640,8 @@ async def start_bot_with_retry():
                 delay = min(base_delay * (2 ** attempt), max_delay)
                 jitter = delay * 0.1 * (0.5 + (hash(str(attempt)) % 100) / 100)
                 total_delay = delay + jitter
+                
+                print(f"Cloudflare block detected, waiting {total_delay:.1f}s")
                 
                 # Reset client connection to avoid hanging
                 try:
@@ -636,6 +655,7 @@ async def start_bot_with_retry():
             elif '429' in error_text:
                 # Regular rate limit, shorter delay
                 delay = 30 + (attempt * 10)
+                print(f"Rate limited, waiting {delay}s")
                 await asyncio.sleep(delay)
                 continue
                 
@@ -644,9 +664,11 @@ async def start_bot_with_retry():
                 raise
                 
         except discord.errors.LoginFailure:
+            print("Login failed - invalid token")
             return
             
         except KeyboardInterrupt:
+            print("Bot stopped by user")
             return
             
         except Exception as e:
@@ -654,11 +676,13 @@ async def start_bot_with_retry():
             if is_cloudflare_block_error(error_text):
                 # Handle Cloudflare errors that might not come through HTTPException
                 delay = min(base_delay * (2 ** attempt), max_delay)
+                print(f"Cloudflare block detected, waiting {delay}s")
                 await asyncio.sleep(delay)
                 continue
             else:
+                print(f"Unexpected error: {e}")
                 await asyncio.sleep(60)  # Wait 1 minute before retry
 
-# Main execution - simple approach
+# Main execution - enhanced with retry logic
 if __name__ == "__main__":
-    client.run(DISCORD_TOKEN)
+    asyncio.run(start_bot_with_retry())
