@@ -23,20 +23,36 @@ last_connection_time = 0
 MAX_RETRIES = 5
 
 posted_ids = set()
-DB_NAME = os.path.join(os.getenv('DATA_DIR', '/data'), 'subscriptions.db')
+# Use different paths for local vs Render environments
+if os.getenv('RENDER') == 'true':
+    DB_NAME = os.path.join('/data', 'subscriptions.db')
+    print("Using Render environment with database at /data/subscriptions.db")
+else:
+    DB_NAME = 'subscriptions.db'
+    print("Using local environment with database at subscriptions.db")
 
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            userId TEXT PRIMARY KEY,
-            subscribed BOOLEAN DEFAULT FALSE,
-            tags TEXT DEFAULT '[]'
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        # Ensure data directory exists
+        data_dir = os.path.dirname(DB_NAME)
+        if data_dir and data_dir != '.':
+            os.makedirs(data_dir, exist_ok=True)
+        
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                userId TEXT PRIMARY KEY,
+                subscribed BOOLEAN DEFAULT FALSE,
+                tags TEXT DEFAULT '[]'
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        print(f"Database initialized successfully at {DB_NAME}")
+    except Exception as e:
+        print(f"Database initialization failed: {e}")
+        raise
 
 def get_connection():
     conn = sqlite3.connect(DB_NAME)
@@ -47,32 +63,41 @@ def get_connection():
     return conn
 
 def load_subscriptions():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT * FROM subscriptions')
-    rows = cursor.fetchall()
-    conn.close()
-    
-    subscriptions = {}
-    for row in rows:
-        subscriptions[row['userId']] = {
-            'subscribed': bool(row['subscribed']),
-            'tags': json.loads(row['tags']) if row['tags'] else []
-        }
-    return subscriptions
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM subscriptions')
+        rows = cursor.fetchall()
+        conn.close()
+        
+        subscriptions = {}
+        for row in rows:
+            subscriptions[row['userId']] = {
+                'subscribed': bool(row['subscribed']),
+                'tags': json.loads(row['tags']) if row['tags'] else []
+            }
+        return subscriptions
+    except Exception as e:
+        print(f"Error loading subscriptions: {e}")
+        return {}  # Return empty dict to prevent crashes
 
 def save_subscriptions(subscriptions):
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    for user_id, user_data in subscriptions.items():
-        cursor.execute('''
-            INSERT OR REPLACE INTO subscriptions (userId, subscribed, tags)
-            VALUES (?, ?, ?)
-        ''', (user_id, user_data['subscribed'], json.dumps(user_data['tags'])))
-    
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        
+        for user_id, user_data in subscriptions.items():
+            cursor.execute('''
+                INSERT OR REPLACE INTO subscriptions (userId, subscribed, tags)
+                VALUES (?, ?, ?)
+            ''', (user_id, user_data['subscribed'], json.dumps(user_data['tags'])))
+        
+        conn.commit()
+        conn.close()
+        print(f"Saved subscriptions for {len(subscriptions)} users")
+    except Exception as e:
+        print(f"Error saving subscriptions: {e}")
+        # Don't crash the bot, just log the error
 
 import time
 import random
@@ -340,7 +365,7 @@ async def on_disconnect():
     await asyncio.sleep(1)  # Give tasks time to clean up
 
 async def start_bot_with_backoff():
-    """Start bot with exponential backoff for 429 errors"""
+    """Start bot with exponential backoff for 429 errors - only for initial connection"""
     for attempt in range(MAX_RETRIES):
         try:
             # Add delay before first connection attempt to allow previous session to expire
@@ -377,9 +402,11 @@ async def start_bot_with_backoff():
             if attempt < MAX_RETRIES - 1:
                 await asyncio.sleep(5)  # Brief delay before retry
     
-    print("Max connection attempts reached. Bot will exit.")
-    await client.close()
-    sys.exit(1)
+    # Only exit if we failed to connect, not for runtime errors
+    if not client.is_ready():
+        print("Max connection attempts reached. Bot will exit.")
+        await client.close()
+        sys.exit(1)
 
 def signal_handler(sig, frame):
     """Handle graceful shutdown"""
@@ -393,108 +420,137 @@ def signal_handler(sig, frame):
 
 @client.event
 async def on_message(message):
-    if message.author == client.user:
-        return
-    
-    # Only allow commands in the specified channel
-    if message.channel.id != CHANNEL_ID:
-        return
-    
-    content = message.content.strip()
-    
-    if content.startswith('!yc-news subscribe'):
-        subscriptions = load_subscriptions()
-        user_id = str(message.author.id)
-        
-        if user_id not in subscriptions:
-            subscriptions[user_id] = {'subscribed': True, 'tags': []}
-        else:
-            subscriptions[user_id]['subscribed'] = True
-        
-        save_subscriptions(subscriptions)
-        await message.author.send("✅ You have been subscribed to YC News updates!")
-        await message.channel.send(f"{message.author.mention} subscribed")
-        
-    elif content.startswith('!yc-news unsubscribe'):
-        subscriptions = load_subscriptions()
-        user_id = str(message.author.id)
-        
-        if user_id in subscriptions:
-            subscriptions[user_id]['subscribed'] = False
-        
-        save_subscriptions(subscriptions)
-        await message.author.send("❌ You have been unsubscribed from YC News updates.")
-        await message.channel.send(f"{message.author.mention} unsubscribed")
-        
-    elif content.startswith('!yc-news add='):
-        subscriptions = load_subscriptions()
-        user_id = str(message.author.id)
-        
-        if user_id not in subscriptions:
-            subscriptions[user_id] = {'subscribed': True, 'tags': []}
-        
-        tags_str = content.split('=', 1)[1].strip()
-        if tags_str.startswith('"') and tags_str.endswith('"'):
-            tags_str = tags_str[1:-1]
-        
-        new_tags = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
-        
-        if user_id not in subscriptions:
-            subscriptions[user_id] = {'subscribed': True, 'tags': []}
-        if 'tags' not in subscriptions[user_id]:
-            subscriptions[user_id]['tags'] = []
-            
-        for tag in new_tags:
-            if tag not in subscriptions[user_id]['tags']:
-                subscriptions[user_id]['tags'].append(tag)
-        
-        save_subscriptions(subscriptions)
-        await message.author.send(f"✅ You added {', '.join(new_tags)}")
-        await message.channel.send(f"{message.author.mention} added \"{', '.join(new_tags)}\"")
-        
-    elif content.startswith('!yc-news remove='):
-        subscriptions = load_subscriptions()
-        user_id = str(message.author.id)
-        
-        if user_id not in subscriptions:
-            await message.author.send("❌ You are not subscribed yet.")
+    try:
+        if message.author == client.user:
             return
         
-        tags_str = content.split('=', 1)[1].strip()
-        if tags_str.startswith('"') and tags_str.endswith('"'):
-            tags_str = tags_str[1:-1]
-        
-        tags_to_remove = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
-        
-        if 'tags' not in subscriptions[user_id]:
-            subscriptions[user_id]['tags'] = []
-            
-        removed_tags = []
-        for tag in tags_to_remove:
-            if tag in subscriptions[user_id]['tags']:
-                subscriptions[user_id]['tags'].remove(tag)
-                removed_tags.append(tag)
-        
-        save_subscriptions(subscriptions)
-        if removed_tags:
-            await message.author.send(f"✅ You removed {', '.join(removed_tags)}")
-            await message.channel.send(f"{message.author.mention} removed {', '.join(removed_tags)}")
-        else:
-            await message.author.send("❌ No matching tags found.")
-            
-    elif content == '!yc-news tags':
-        subscriptions = load_subscriptions()
-        user_id = str(message.author.id)
-        
-        if user_id not in subscriptions:
-            await message.author.send("❌ You are not subscribed yet.")
+        # Only allow commands in the specified channel
+        if message.channel.id != CHANNEL_ID:
             return
         
-        tags = subscriptions[user_id].get('tags', [])
-        if tags:
-            await message.author.send(f"📋 Your current tags are {', '.join(tags)}")
-        else:
-            await message.author.send("📋 You have no tags subscribed. Use `!yc-news add=\"AI, ML\"` to add tags.")
+        content = message.content.strip()
+        
+        if content.startswith('!yc-news subscribe'):
+            try:
+                subscriptions = load_subscriptions()
+                user_id = str(message.author.id)
+                
+                if user_id not in subscriptions:
+                    subscriptions[user_id] = {'subscribed': True, 'tags': []}
+                else:
+                    subscriptions[user_id]['subscribed'] = True
+                
+                save_subscriptions(subscriptions)
+                await message.author.send("✅ You have been subscribed to YC News updates!")
+                await message.channel.send(f"{message.author.mention} subscribed")
+            except Exception as e:
+                print(f"Error in subscribe command: {e}")
+                await message.channel.send("❌ Error processing subscription. Please try again.")
+                
+        elif content.startswith('!yc-news unsubscribe'):
+            try:
+                subscriptions = load_subscriptions()
+                user_id = str(message.author.id)
+                
+                if user_id in subscriptions:
+                    subscriptions[user_id]['subscribed'] = False
+                
+                save_subscriptions(subscriptions)
+                await message.author.send("❌ You have been unsubscribed from YC News updates.")
+                await message.channel.send(f"{message.author.mention} unsubscribed")
+            except Exception as e:
+                print(f"Error in unsubscribe command: {e}")
+                await message.channel.send("❌ Error processing unsubscription. Please try again.")
+                
+        elif content.startswith('!yc-news add='):
+            try:
+                subscriptions = load_subscriptions()
+                user_id = str(message.author.id)
+                
+                if user_id not in subscriptions:
+                    subscriptions[user_id] = {'subscribed': True, 'tags': []}
+                
+                tags_str = content.split('=', 1)[1].strip()
+                if tags_str.startswith('"') and tags_str.endswith('"'):
+                    tags_str = tags_str[1:-1]
+                
+                new_tags = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
+                
+                if user_id not in subscriptions:
+                    subscriptions[user_id] = {'subscribed': True, 'tags': []}
+                if 'tags' not in subscriptions[user_id]:
+                    subscriptions[user_id]['tags'] = []
+                    
+                for tag in new_tags:
+                    if tag not in subscriptions[user_id]['tags']:
+                        subscriptions[user_id]['tags'].append(tag)
+                
+                save_subscriptions(subscriptions)
+                await message.author.send(f"✅ You added {', '.join(new_tags)}")
+                await message.channel.send(f"{message.author.mention} added \"{', '.join(new_tags)}\"")
+            except Exception as e:
+                print(f"Error in add tags command: {e}")
+                await message.channel.send("❌ Error adding tags. Please try again.")
+                
+        elif content.startswith('!yc-news remove='):
+            try:
+                subscriptions = load_subscriptions()
+                user_id = str(message.author.id)
+                
+                if user_id not in subscriptions:
+                    await message.author.send("❌ You are not subscribed yet.")
+                    return
+                
+                tags_str = content.split('=', 1)[1].strip()
+                if tags_str.startswith('"') and tags_str.endswith('"'):
+                    tags_str = tags_str[1:-1]
+                
+                tags_to_remove = [tag.strip() for tag in tags_str.split(',') if tag.strip()]
+                
+                if 'tags' not in subscriptions[user_id]:
+                    subscriptions[user_id]['tags'] = []
+                    
+                removed_tags = []
+                for tag in tags_to_remove:
+                    if tag in subscriptions[user_id]['tags']:
+                        subscriptions[user_id]['tags'].remove(tag)
+                        removed_tags.append(tag)
+                
+                save_subscriptions(subscriptions)
+                if removed_tags:
+                    await message.author.send(f"✅ You removed {', '.join(removed_tags)}")
+                    await message.channel.send(f"{message.author.mention} removed {', '.join(removed_tags)}")
+                else:
+                    await message.author.send("❌ No matching tags found.")
+            except Exception as e:
+                print(f"Error in remove tags command: {e}")
+                await message.channel.send("❌ Error removing tags. Please try again.")
+                
+        elif content == '!yc-news tags':
+            try:
+                subscriptions = load_subscriptions()
+                user_id = str(message.author.id)
+                
+                if user_id not in subscriptions:
+                    await message.author.send("❌ You are not subscribed yet.")
+                    return
+                
+                tags = subscriptions[user_id].get('tags', [])
+                if tags:
+                    await message.author.send(f"📋 Your current tags are {', '.join(tags)}")
+                else:
+                    await message.author.send("📋 You have no tags subscribed. Use `!yc-news add=\"AI, ML\"` to add tags.")
+            except Exception as e:
+                print(f"Error in tags command: {e}")
+                await message.channel.send("❌ Error retrieving tags. Please try again.")
+            
+    except Exception as e:
+        print(f"Error in on_message handler: {e}")
+        # Send error message to user
+        try:
+            await message.channel.send("❌ An error occurred while processing your command. Please try again.")
+        except:
+            pass  # Don't crash if we can't send error message
 
 # Register signal handlers for graceful shutdown
 signal.signal(signal.SIGINT, signal_handler)
