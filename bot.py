@@ -35,6 +35,8 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 # Initialize Supabase client
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 print("Connected to Supabase database")
+print(f"Supabase URL: {SUPABASE_URL}")
+print(f"Environment: {os.getenv('RENDER', 'local')}")
 
 async def init_db():
     """Initialize Supabase - ensure table exists"""
@@ -299,9 +301,12 @@ async def safe_send_dm(user, embed):
 
 @tasks.loop(hours=1)
 async def poll_hn():
+    print("=== Starting poll_hn loop ===")
     try:
         subscriptions = await load_subscriptions()
-        print(f"Starting hourly poll for {len([s for s in subscriptions.values() if s.get('subscribed')])} subscribed users")
+        subscribed_count = len([s for s in subscriptions.values() if s.get('subscribed')])
+        print(f"Loaded {len(subscriptions)} total subscriptions")
+        print(f"Starting hourly poll for {subscribed_count} subscribed users")
         
         # Collect all unique tag combinations to minimize API calls
         tag_combinations = {}
@@ -328,6 +333,7 @@ async def poll_hn():
         
         if not all_new_items:
             print("No new items found")
+            print("=== poll_hn loop completed ===")
             return
         
         # Batch fetch metadata for all new items at once
@@ -393,17 +399,22 @@ async def poll_hn():
                     try:
                         await safe_send_dm(user, embed)
                         await asyncio.sleep(5)  # Increased delay between DMs
-                    except discord.Forbidden:
-                        print(f"Cannot send DM to user {user_id}")
-                        break  # Stop trying to send to this user if DMs are forbidden
+                except discord.Forbidden:
+                    print(f"Cannot send DM to user {user_id}")
+                    break  # Stop trying to send to this user if DMs are forbidden
+        
+        print("=== poll_hn loop completed successfully ===")
                     
     except Exception as e:
         print(f"Error in poll_hn loop: {e}")
+        print("=== poll_hn loop completed with error ===")
 
 @client.event
 async def on_ready():
     await init_db()
     print(f"Logged in as {client.user}")
+    print(f"Discord token present: {'Yes' if DISCORD_TOKEN else 'No'}")
+    print(f"Channel ID: {CHANNEL_ID}")
     poll_hn.start()
     print("Bot is running. Press Ctrl+C to stop.")
 
