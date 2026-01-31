@@ -464,6 +464,10 @@ async def on_message(message):
         if message.author == client.user:
             return
         
+        # Debug: log message reception
+        if message.channel.id == CHANNEL_ID:
+            print(f"Received message: {message.content.strip()[:50]}...")
+        
         # Only allow commands in the specified channel
         if message.channel.id != CHANNEL_ID:
             return
@@ -653,12 +657,8 @@ async def start_bot_with_retry():
                 await asyncio.sleep(delay)
                 continue
             else:
-                if attempt >= max_retries - 1:
-                    import traceback
-                    traceback.print_exc()
-                else:
-                    await asyncio.sleep(60)  # Wait 1 minute before retry
+                await asyncio.sleep(60)  # Wait 1 minute before retry
 
-# Main execution - enhanced with retry logic
+# Main execution - simple approach
 if __name__ == "__main__":
-    asyncio.run(start_bot_with_retry())
+    client.run(DISCORD_TOKEN)
