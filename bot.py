@@ -2,19 +2,28 @@ import os
 import asyncio
 import requests
 import json
-import time
-import random
 import signal
 import sys
-from bs4 import BeautifulSoup
 import discord
+import time
 from discord.ext import tasks
 from dotenv import load_dotenv
 from supabase import create_client, Client
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))  # Default to 0 if not set
+
+# Validate required environment variables
+if not DISCORD_TOKEN:
+    print("Error: DISCORD_TOKEN environment variable is required")
+    exit(1)
+
+if not CHANNEL_ID:
+    print("Error: CHANNEL_ID environment variable is required")
+    exit(1)
+
+print("Environment variables loaded successfully")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -24,6 +33,24 @@ client = discord.Client(intents=intents)
 
 posted_ids = set()
 
+# Rate limiting configuration
+DISCORD_RATE_LIMIT = {
+    'fetch_user_delay': 0.1,  # 100ms between user fetches (10 per second)
+    'dm_delay': 1.0,  # 1 second between DMs (1 per second)
+    'batch_size': 5,  # Process users in batches
+    'batch_delay': 5.0  # 5 seconds between batches
+}
+
+ALGOLIA_RATE_LIMIT = {
+    'requests_per_minute': 50,  # Conservative limit
+    'request_delay': 1.2  # 1.2 seconds between requests
+}
+
+# Request tracking for rate limiting
+algolia_request_times = []
+last_user_fetch_time = 0
+last_dm_time = 0
+
 # Supabase configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -32,11 +59,13 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     print("Error: SUPABASE_URL and SUPABASE_KEY environment variables are required")
     exit(1)
 
-# Initialize Supabase client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-print("Connected to Supabase database")
-print(f"Supabase URL: {SUPABASE_URL}")
-print(f"Environment: {os.getenv('RENDER', 'local')}")
+# Initialize Supabase client with error handling
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("Connected to Supabase database")
+except Exception as e:
+    print(f"Failed to connect to Supabase: {e}")
+    exit(1)
 
 async def init_db():
     """Initialize Supabase - ensure table exists"""
@@ -46,6 +75,60 @@ async def init_db():
     except Exception as e:
         print(f"Database initialization failed: {e}")
         raise
+
+async def rate_limit_wait(category='discord', delay=None):
+    """Implement rate limiting delays"""
+    if category == 'algolia':
+        global algolia_request_times
+        current_time = time.time()
+        # Remove requests older than 1 minute
+        algolia_request_times = [t for t in algolia_request_times if current_time - t < 60]
+        
+        if len(algolia_request_times) >= ALGOLIA_RATE_LIMIT['requests_per_minute']:
+            sleep_time = 60 - (current_time - algolia_request_times[0])
+            if sleep_time > 0:
+                print(f"Algolia rate limit reached, sleeping {sleep_time:.1f}s")
+                await asyncio.sleep(sleep_time)
+        
+        algolia_request_times.append(current_time)
+        await asyncio.sleep(ALGOLIA_RATE_LIMIT['request_delay'])
+    
+    elif category == 'discord_fetch':
+        global last_user_fetch_time
+        current_time = time.time()
+        time_since_last = current_time - last_user_fetch_time
+        if time_since_last < DISCORD_RATE_LIMIT['fetch_user_delay']:
+            await asyncio.sleep(DISCORD_RATE_LIMIT['fetch_user_delay'] - time_since_last)
+        last_user_fetch_time = time.time()
+    
+    elif category == 'discord_dm':
+        global last_dm_time
+        current_time = time.time()
+        time_since_last = current_time - last_dm_time
+        if time_since_last < DISCORD_RATE_LIMIT['dm_delay']:
+            await asyncio.sleep(DISCORD_RATE_LIMIT['dm_delay'] - time_since_last)
+        last_dm_time = time.time()
+
+async def retry_with_backoff(func, max_retries=3, base_delay=1):
+    """Retry function with exponential backoff"""
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except discord.HTTPException as e:
+            if hasattr(e, 'status') and e.status == 429:
+                wait_time = base_delay * (2 ** attempt) + (attempt * 0.1)  # Add jitter
+                print(f"Rate limited (attempt {attempt + 1}), waiting {wait_time:.1f}s")
+                await asyncio.sleep(wait_time)
+                if attempt == max_retries - 1:
+                    raise
+            else:
+                raise
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            wait_time = base_delay * (2 ** attempt)
+            print(f"Error (attempt {attempt + 1}), retrying in {wait_time:.1f}s: {e}")
+            await asyncio.sleep(wait_time)
 
 async def load_subscriptions():
     """Load all subscriptions from Supabase"""
@@ -84,144 +167,12 @@ async def save_subscriptions(subscriptions):
         print(f"Error saving subscriptions to Supabase: {e}")
         # Don't crash bot, just log the error
 
-def fetch_meta_data(url):
-    """Fetch meta description and image from a URL with retry logic"""
-    # Skip internal HN links
-    if url.startswith("item?id="):
-        return None, None
-    
-    # Ensure URL is absolute
-    if not url.startswith(("http://", "https://")):
-        url = "https://news.ycombinator.com/" + url
-    
-    # Multiple user agents to rotate through
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    ]
-    
-    # Enhanced headers to look more like a real browser and avoid Cloudflare detection
-    base_headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": "en-US,en;q=0.9,en-GB;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"macOS"',
-    }
-    
-    max_retries = 5  # Increased retries for Cloudflare rate limits
-    base_timeout = 20  # Increased timeout
-    
-    for attempt in range(max_retries):
-        try:
-            # Rotate user agent
-            headers = base_headers.copy()
-            headers["User-Agent"] = random.choice(user_agents)
-            
-            # Exponential backoff for timeout
-            timeout = base_timeout * (2 ** attempt)
-            
-            # Add random delay between requests to avoid pattern detection
-            if attempt > 0:
-                delay = random.uniform(1, 3)
-                time.sleep(delay)
-            
-            response = requests.get(url, timeout=timeout, headers=headers)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, "html.parser")
-            
-            # Try to get meta description
-            description = None
-            meta_desc = soup.find("meta", attrs={"name": "description"})
-            if meta_desc and meta_desc.get("content"):
-                description = meta_desc.get("content").strip()
-            else:
-                # Fallback to og:description
-                og_desc = soup.find("meta", attrs={"property": "og:description"})
-                if og_desc and og_desc.get("content"):
-                    description = og_desc.get("content").strip()
-            
-            # Try to get meta image
-            image_url = None
-            og_image = soup.find("meta", attrs={"property": "og:image"})
-            if og_image and og_image.get("content"):
-                image_url = og_image.get("content").strip()
-                # Convert relative URLs to absolute
-                if image_url.startswith("//"):
-                    image_url = "https:" + image_url
-                elif image_url.startswith("/"):
-                    from urllib.parse import urljoin
-                    image_url = urljoin(url, image_url)
-                elif not image_url.startswith(("http://", "https://")):
-                    from urllib.parse import urljoin
-                    image_url = urljoin(url, image_url)
-            
-            return description, image_url
-            
-        except requests.exceptions.Timeout as e:
-            if attempt < max_retries - 1:
-                wait_time = (2 ** attempt) + random.uniform(0, 1)
-                print(f"Timeout for {url}, retry {attempt + 1}/{max_retries} after {wait_time:.1f}s")
-                time.sleep(wait_time)
-            else:
-                print(f"Timeout error fetching meta data for {url}: {e}")
-                return None, None
-                
-        except requests.exceptions.HTTPError as e:
-            status_code = e.response.status_code
-            if status_code in [403, 429]:
-                # Handle Cloudflare rate limits and forbidden errors with longer delays
-                if attempt < max_retries - 1:
-                    wait_time = (3 ** attempt) + random.uniform(2, 5)  # Longer backoff for 403/429
-                    print(f"HTTP {status_code} (likely Cloudflare) for {url}, retry {attempt + 1}/{max_retries} after {wait_time:.1f}s")
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    print(f"HTTP {status_code} error fetching meta data for {url}")
-                    return None, None
-            elif status_code in [404, 410]:
-                # Don't retry for client errors (except 403/429)
-                print(f"Client error {status_code} for {url}: {e}")
-                return None, None
-            else:
-                # Retry for other HTTP errors
-                if attempt < max_retries - 1:
-                    wait_time = (2 ** attempt) + random.uniform(0, 1)
-                    print(f"HTTP error {status_code} for {url}, retry {attempt + 1}/{max_retries} after {wait_time:.1f}s")
-                    time.sleep(wait_time)
-                else:
-                    print(f"HTTP error fetching meta data for {url}: {e}")
-                    return None, None
-                    
-        except requests.exceptions.RequestException as e:
-            if attempt < max_retries - 1:
-                wait_time = (2 ** attempt) + random.uniform(0, 1)
-                print(f"Request error for {url}, retry {attempt + 1}/{max_retries} after {wait_time:.1f}s: {e}")
-                time.sleep(wait_time)
-            else:
-                print(f"Request error fetching meta data for {url}: {e}")
-                return None, None
-                
-        except Exception as e:
-            print(f"Unexpected error fetching meta data for {url}: {e}")
-            return None, None
-    
-    return None, None
+# REMOVED: fetch_meta_data function to prevent 429 rate limiting errors
 
-def fetch_newest(top_n=15, tags=None):
+async def fetch_newest_async(top_n=15, tags=None):
+    """Async version of fetch_newest with rate limiting"""
+    await rate_limit_wait('algolia')
+    
     # API endpoint that powers your requested URL: 
     # https://hn.algolia.com/?dateRange=last24h&page=0&prefix=true&sort=byDate&type=story
     api_url = "https://hn.algolia.com/api/v1/search"
@@ -244,8 +195,6 @@ def fetch_newest(top_n=15, tags=None):
         params['query'] = ' '.join(tags)
     
     try:
-        # Add delay to avoid rate limiting the Algolia API
-        time.sleep(random.uniform(0.5, 1.5))
         resp = requests.get(api_url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
@@ -277,27 +226,62 @@ def fetch_newest(top_n=15, tags=None):
         print(f"Error fetching from Algolia: {e}")
         return []
 
-async def safe_send_dm(user, embed):
-    """Send DM with exponential backoff for rate limiting"""
-    max_retries = 5  # Increased retries
-    for attempt in range(max_retries):
-        try:
-            await user.send(embed=embed)
-            return True
-        except discord.HTTPException as e:
-            if hasattr(e, 'status') and e.status == 429:
-                # More aggressive backoff for 429 errors
-                wait_time = (2 ** attempt) + random.uniform(1, 3)
-                print(f"Rate limited (429), waiting {wait_time:.1f}s before retry {attempt + 1}/{max_retries}")
-                await asyncio.sleep(wait_time)
-                continue
-            else:
-                raise
-        except Exception as e:
-            print(f"Error sending DM: {e}")
-            return False
-    print(f"Failed to send DM after {max_retries} attempts")
-    return False
+def fetch_newest(top_n=15, tags=None):
+    """Synchronous version for backward compatibility"""
+    # API endpoint that powers your requested URL: 
+    # https://hn.algolia.com/?dateRange=last24h&page=0&prefix=true&sort=byDate&type=story
+    api_url = "https://hn.algolia.com/api/v1/search"
+    
+    # Parameters that match your URL requirements
+    params = {
+        'tags': 'story',  # type=story
+        'hitsPerPage': top_n
+    }
+    
+    # Handle dateRange=last24h
+    twenty_four_hours_ago = int(time.time()) - 86400
+    params['numericFilters'] = f'created_at_i>{twenty_four_hours_ago}'
+    
+    # Handle query tags - integrates tags with URL as specified
+    # When users add tags like "AI, ML, LLMs", each word is parsed and added to the URL
+    # This corresponds to &query=AI&query=ML&query=LLMs in the base URL
+    # For the API, we combine them into a single query string
+    if tags:
+        params['query'] = ' '.join(tags)
+    
+    try:
+        resp = requests.get(api_url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        items = []
+        for hit in data.get('hits', []):
+            title = hit.get('title', 'No title')
+            story_url = hit.get('url', '')
+            if not story_url:
+                story_url = hit.get('story_url', '')
+            
+            object_id = hit.get('objectID', str(len(items)))
+            hn_link = f"https://news.ycombinator.com/item?id={object_id}"
+            
+            # Convert timestamp to readable age
+            created_at = hit.get('created_at', 'recent')
+            
+            items.append({
+                "id": object_id,
+                "title": title,
+                "url": story_url,
+                "hn_link": hn_link,
+                "age": created_at,
+            })
+        
+        return items
+        
+    except Exception as e:
+        print(f"Error fetching from Algolia: {e}")
+        return []
+
+# REMOVED: safe_send_dm function - sending DMs directly to reduce complexity
 
 @tasks.loop(hours=1)
 async def poll_hn():
@@ -321,14 +305,14 @@ async def poll_hn():
         
         print(f"Fetching {len(tag_combinations)} unique tag combinations instead of {len(subscriptions)} individual requests")
         
-        # Fetch items once per unique tag combination
+        # Fetch items once per unique tag combination with rate limiting
         all_new_items = {}
         for tags, user_list in tag_combinations.items():
-            items = fetch_newest(10, list(tags))  # Reduced from 15 to 10
+            items = await fetch_newest_async(8, list(tags))  # Reduced to 8 items
             new_items = [it for it in items if it["id"] not in posted_ids]
             if new_items:
-                all_new_items[tags] = new_items[:3]  # Limit to 3 items per tag combination
-                for item in new_items[:3]:
+                all_new_items[tags] = new_items[:2]  # Limit to 2 items per tag combination
+                for item in new_items[:2]:
                     posted_ids.add(item["id"])
         
         if not all_new_items:
@@ -336,72 +320,63 @@ async def poll_hn():
             print("=== poll_hn loop completed ===")
             return
         
-        # Batch fetch metadata for all new items at once
-        print(f"Fetching metadata for {sum(len(items) for items in all_new_items.values())} items")
-        metadata_cache = {}
-        for tags, items in all_new_items.items():
-            for item in items:
-                if item["url"] and not item["url"].startswith("item?id="):
-                    if item["url"] not in metadata_cache:
-                        metadata_cache[item["url"]] = fetch_meta_data(item["url"])
-                        time.sleep(2)  # Delay between metadata fetches
-        
-        # Now send to users
+        # Batch process users to avoid rate limits
+        all_users_to_process = []
         for tags, user_list in tag_combinations.items():
             if tags not in all_new_items:
                 continue
-                
-            items = all_new_items[tags]
-            
-            # Fetch users for this tag combination
             for user_id in user_list:
+                all_users_to_process.append((user_id, all_new_items[tags]))
+        
+        print(f"Processing {len(all_users_to_process)} user deliveries in batches")
+        
+        # Process users in batches with rate limiting
+        for i in range(0, len(all_users_to_process), DISCORD_RATE_LIMIT['batch_size']):
+            batch = all_users_to_process[i:i + DISCORD_RATE_LIMIT['batch_size']]
+            
+            # Process each user in the batch
+            for user_id, items in batch:
                 try:
-                    user = await client.fetch_user(int(user_id))
+                    # Rate limit user fetching
+                    await rate_limit_wait('discord_fetch')
+                    
+                    # Fetch user with retry logic
+                    user = await retry_with_backoff(
+                        lambda: client.fetch_user(int(user_id)),
+                        max_retries=3
+                    )
+                    
                     if not user:
                         continue
-                except discord.HTTPException as e:
-                    if hasattr(e, 'status') and e.status == 429:
-                        print(f"Rate limited fetching user {user_id}, skipping...")
-                        continue
-                    else:
-                        raise
-                
-                # Send items to this user
-                for item in items:
-                    description, image_url = metadata_cache.get(item["url"], (None, None))
-                    if description:
-                        description = description[:1800]
-
-                    source_link = item["hn_link"] if item["url"].startswith("item?id=") else item["url"]
                     
-                    # Always include the URL in the description
-                    if description:
-                        base_desc = description
-                        extra = f"\n\n📰 **Source**: {source_link}"
-                    else:
-                        # If no description was fetched, still include the URL
-                        base_desc = "No description available"
-                        extra = f"\n\n📰 **Source**: {source_link}"
+                    # Send items to this user with rate limiting
+                    for item in items:
+                        source_link = item["hn_link"] if item["url"].startswith("item?id=") else item["url"]
+                        
+                        embed = discord.Embed(
+                            title=item["title"][:256],
+                            description=f"📰 **Source**: {source_link}",
+                            url=source_link
+                        )
 
-                    full_desc = (base_desc + extra)
-                    if len(full_desc) > 4000:
-                        full_desc = full_desc[:4000]
-
-                    embed = discord.Embed(
-                        title=item["title"][:256],
-                        description=full_desc,
-                        url=source_link  # Make the title clickable
-                    )
-
-                    if image_url:
-                        embed.set_image(url=image_url)
-
-                    try:
-                        await safe_send_dm(user, embed)
-                        await asyncio.sleep(5)  # Increased delay between DMs
-                    except discord.Forbidden:
-                        print(f"Cannot send DM to user {user_id}")
-                        break  # Stop trying to send to this user if DMs are forbidden
+                        # Rate limit DM sending with retry logic
+                        await rate_limit_wait('discord_dm')
+                        await retry_with_backoff(
+                            lambda: user.send(embed=embed),
+                            max_retries=3
+                        )
+                        
+                except discord.Forbidden:
+                    print(f"Cannot send DM to user {user_id}")
+                    continue
+                except Exception as e:
+                    print(f"Error processing user {user_id}: {e}")
+                    continue
+            
+            # Add delay between batches
+            if i + DISCORD_RATE_LIMIT['batch_size'] < len(all_users_to_process):
+                print(f"Batch completed, waiting {DISCORD_RATE_LIMIT['batch_delay']}s before next batch")
+                await asyncio.sleep(DISCORD_RATE_LIMIT['batch_delay'])
         
         print("=== poll_hn loop completed successfully ===")
                     
@@ -575,11 +550,15 @@ signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
 # Main execution - simple approach
-try:
-    client.run(DISCORD_TOKEN)
-except discord.errors.LoginFailure:
-    print("Error: Invalid Discord token. Please check your DISCORD_TOKEN in environment variables.")
-except KeyboardInterrupt:
-    print("\nBot stopped by user.")
-except Exception as e:
-    print(f"Error starting bot: {e}")
+if __name__ == "__main__":
+    print("Starting bot...")
+    try:
+        client.run(DISCORD_TOKEN)
+    except discord.errors.LoginFailure:
+        print("Error: Invalid Discord token. Please check your DISCORD_TOKEN in environment variables.")
+    except KeyboardInterrupt:
+        print("\nBot stopped by user.")
+    except Exception as e:
+        print(f"Error starting bot: {e}")
+        import traceback
+        traceback.print_exc()  # Print full traceback for debugging
