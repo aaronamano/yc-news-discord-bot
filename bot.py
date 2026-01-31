@@ -266,14 +266,15 @@ def fetch_newest(top_n=15, tags=None):
 
 async def safe_send_dm(user, embed):
     """Send DM with exponential backoff for rate limiting"""
-    max_retries = 3
+    max_retries = 5  # Increased retries
     for attempt in range(max_retries):
         try:
             await user.send(embed=embed)
             return True
         except discord.HTTPException as e:
             if hasattr(e, 'status') and e.status == 429:
-                wait_time = 2 ** attempt + random.uniform(0, 1)
+                # More aggressive backoff for 429 errors
+                wait_time = (2 ** attempt) + random.uniform(1, 3)
                 print(f"Rate limited (429), waiting {wait_time:.1f}s before retry {attempt + 1}/{max_retries}")
                 await asyncio.sleep(wait_time)
                 continue
@@ -302,7 +303,18 @@ async def poll_hn():
             if not new_items:
                 continue
 
-            user = await client.fetch_user(int(user_id))
+            # Add delay between user fetches to avoid rate limiting
+            await asyncio.sleep(2)
+            
+            try:
+                user = await client.fetch_user(int(user_id))
+            except discord.HTTPException as e:
+                if hasattr(e, 'status') and e.status == 429:
+                    print(f"Rate limited fetching user {user_id}, skipping...")
+                    continue
+                else:
+                    raise
+                    
             if not user:
                 continue
 
@@ -339,9 +351,10 @@ async def poll_hn():
 
                 try:
                     await safe_send_dm(user, embed)
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(3)  # Increased delay to avoid rate limiting
                 except discord.Forbidden:
                     print(f"Cannot send DM to user {user_id}")
+                    break  # Stop trying to send to this user if DMs are forbidden
                     
     except Exception as e:
         print(f"Error in poll_hn loop: {e}")
