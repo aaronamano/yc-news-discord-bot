@@ -76,7 +76,8 @@ class CircuitBreaker:
         self.state = CircuitState.CLOSED
         self.lock = threading.Lock()
     
-    async def execute(self, operation: Callable):
+    def execute(self, operation: Callable):
+        """Execute operation synchronously (no async here)"""
         with self.lock:
             if self.state == CircuitState.OPEN:
                 if self.last_failure_time and (time.time() * 1000 - self.last_failure_time) > self.timeout_ms:
@@ -396,10 +397,20 @@ def cached_query(ttl: int = 3600, cache_type: str = 'default'):
                 
                 # Execute with circuit breaker protection
                 await rate_limiter.wait_for_slot()
-                result = await circuit_breaker.execute(lambda: func(*args, **kwargs))
                 
-                # Cache the result
-                set_cached_data(cache_key, result, cache_type)
+                # Execute the async function and get the actual result
+                # We need to handle the async function properly
+                if asyncio.iscoroutinefunction(func):
+                    result = await func(*args, **kwargs)
+                else:
+                    result = func(*args, **kwargs)
+                
+                # Cache the result (only if it's JSON serializable)
+                try:
+                    set_cached_data(cache_key, result, cache_type)
+                except (TypeError, ValueError) as e:
+                    print(f"[WARNING] Failed to cache result for {cache_key}: {e}")
+                
                 return result
                 
             except Exception as error:
@@ -414,10 +425,16 @@ def cached_query(ttl: int = 3600, cache_type: str = 'default'):
         return wrapper
     return decorator
 
-@cached_query(ttl=300, cache_type='user_subscriptions')
 async def load_subscriptions():
     """Load user subscriptions from Supabase with caching"""
+    cache_key = "load_subscriptions_all"
+    
     try:
+        # Check cache first
+        cached = get_cached_data(cache_key, 'user_subscriptions')
+        if cached is not None:
+            return cached
+        
         await rate_limiter.wait_for_slot()
         
         response = circuit_breaker.execute(
@@ -438,7 +455,11 @@ async def load_subscriptions():
                 'subscribed': bool(row['subscribed']),
                 'tags': json.loads(row['tags']) if row['tags'] else []
             }
+        
+        # Cache the result
+        set_cached_data(cache_key, subscriptions, 'user_subscriptions')
         return subscriptions
+        
     except Exception as e:
         error_str = str(e)
         if "no RLS policies" in error_str or "no data will be returned" in error_str:
@@ -464,11 +485,11 @@ async def subscribe_user(user_id: str):
         
         # Insert/upsert subscription with circuit breaker protection
         await rate_limiter.wait_for_slot()
-        result = await circuit_breaker.execute(
+        circuit_breaker.execute(
             lambda: supabase.table('subscriptions').upsert({
                 'userId': user_id,
-                'subscribed': subscription_data['subscribed'],
-                'tags': json.dumps(subscription_data['tags'])
+                'subscribed': subscriptions[user_id]['subscribed'],
+                'tags': json.dumps(subscriptions[user_id]['tags'])
             }).execute()
         )
         
@@ -479,7 +500,7 @@ async def subscribe_user(user_id: str):
         else:
             # Try to verify if it worked despite no data return
             await rate_limiter.wait_for_slot()
-            verify_result = await circuit_breaker.execute(
+            verify_result = circuit_breaker.execute(
                 lambda: supabase.table('subscriptions').select('*').eq('userId', user_id).execute()
             )
             if verify_result and verify_result.data:
@@ -512,7 +533,7 @@ async def unsubscribe_user(user_id: str):
             subscriptions[user_id]['subscribed'] = False
         
         await rate_limiter.wait_for_slot()
-        result = await circuit_breaker.execute(
+        result = circuit_breaker.execute(
             lambda: supabase.table('subscriptions').upsert({
                 'userId': user_id,
                 'subscribed': False,
@@ -677,11 +698,14 @@ def set_cached_data(cache_key: str, data: Any, cache_type: str = 'default'):
     
     if REDIS_AVAILABLE and redis_client:
         try:
+            # Only try to JSON serialize for Redis if it's serializable
             redis_client.setex(cache_key, ttl, json.dumps(data))
+        except (TypeError, ValueError) as e:
+            print(f"[WARNING] Redis set failed (not JSON serializable): {e}")
         except Exception as e:
             print(f"[WARNING] Redis set failed: {e}")
     
-    # Fallback to memory cache
+    # Fallback to memory cache (always works)
     with cache_lock:
         user_cache[cache_key] = data
         cache_expiry[cache_key] = time.time()
