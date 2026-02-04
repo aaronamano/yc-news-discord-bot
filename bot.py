@@ -85,10 +85,10 @@ class CircuitBreaker:
                     raise Exception("Circuit breaker is OPEN")
         
         try:
+            # Execute the operation synchronously
             result = operation()
-            # Check if the result is a coroutine, await it if so
-            if asyncio.iscoroutine(result):
-                result = await result
+            
+            # Don't await anything - just return the result directly
             self._on_success()
             return result
         except Exception as error:
