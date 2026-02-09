@@ -485,11 +485,11 @@ async def subscribe_user(user_id: str):
         
         # Insert/upsert subscription with circuit breaker protection
         await rate_limiter.wait_for_slot()
-        circuit_breaker.execute(
+        result = circuit_breaker.execute(
             lambda: supabase.table('subscriptions').upsert({
                 'userId': user_id,
-                'subscribed': subscriptions[user_id]['subscribed'],
-                'tags': json.dumps(subscriptions[user_id]['tags'])
+                'subscribed': subscription_data['subscribed'],
+                'tags': json.dumps(subscription_data['tags'])
             }).execute()
         )
         
