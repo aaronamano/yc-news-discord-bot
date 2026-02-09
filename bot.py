@@ -615,7 +615,7 @@ async def remove_user_tags(user_id: str, tags: list):
         if cached_data:
             subscriptions = {user_id: cached_data}
         else:
-            subscriptions = load_subscriptions()
+            subscriptions = await load_subscriptions()
         
         if user_id not in subscriptions:
             return False, "User is not subscribed", []
