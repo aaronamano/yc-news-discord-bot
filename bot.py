@@ -485,30 +485,17 @@ async def subscribe_user(user_id: str):
         
         # Insert/upsert subscription with circuit breaker protection
         await rate_limiter.wait_for_slot()
-        result = circuit_breaker.execute(
+        circuit_breaker.execute(
             lambda: supabase.table('subscriptions').upsert({
                 'userId': user_id,
-                'subscribed': subscription_data['subscribed'],
-                'tags': json.dumps(subscription_data['tags'])
+                'subscribed': subscriptions[user_id]['subscribed'],
+                'tags': json.dumps(subscriptions[user_id]['tags'])
             }).execute()
         )
         
-        if result and result.data:
-            # Update cache
-            set_cached_user_data(user_id, subscription_data)
-            return True, "Successfully subscribed to YC News updates"
-        else:
-            # Try to verify if it worked despite no data return
-            await rate_limiter.wait_for_slot()
-            verify_result = circuit_breaker.execute(
-                lambda: supabase.table('subscriptions').select('*').eq('userId', user_id).execute()
-            )
-            if verify_result and verify_result.data:
-                # Update cache
-                set_cached_user_data(user_id, subscription_data)
-                return True, "Successfully subscribed to YC News updates"
-            else:
-                return False, "Subscription may not have been created - check table access"
+        # Update cache since upsert succeeded
+        set_cached_user_data(user_id, subscription_data)
+        return True, "Successfully subscribed to YC News updates"
             
     except Exception as e:
         error_str = str(e)
@@ -602,7 +589,7 @@ async def add_user_tags(user_id: str, tags: list):
                 added_tags.append(tag_clean)
         
         await rate_limiter.wait_for_slot()
-        await circuit_breaker.execute(
+        circuit_breaker.execute(
             lambda: supabase.table('subscriptions').upsert({
                 'userId': user_id,
                 'subscribed': subscriptions[user_id]['subscribed'],
@@ -628,7 +615,7 @@ async def remove_user_tags(user_id: str, tags: list):
         if cached_data:
             subscriptions = {user_id: cached_data}
         else:
-            subscriptions = await load_subscriptions()
+            subscriptions = load_subscriptions()
         
         if user_id not in subscriptions:
             return False, "User is not subscribed", []
@@ -644,7 +631,7 @@ async def remove_user_tags(user_id: str, tags: list):
                 removed_tags.append(tag_clean)
         
         await rate_limiter.wait_for_slot()
-        await circuit_breaker.execute(
+        circuit_breaker.execute(
             lambda: supabase.table('subscriptions').upsert({
                 'userId': user_id,
                 'subscribed': subscriptions[user_id]['subscribed'],
@@ -985,6 +972,8 @@ async def on_message(message):
             user_id = str(message.author.id)
             
             tags_str = content.split('=', 1)[1].strip()
+            # Normalize smart quotes to regular quotes
+            tags_str = tags_str.replace('\u201c', '"').replace('\u201d', '"')
             if tags_str.startswith('"') and tags_str.endswith('"'):
                 tags_str = tags_str[1:-1]
             
@@ -1004,6 +993,8 @@ async def on_message(message):
             user_id = str(message.author.id)
             
             tags_str = content.split('=', 1)[1].strip()
+            # Normalize smart quotes to regular quotes
+            tags_str = tags_str.replace('\u201c', '"').replace('\u201d', '"')
             if tags_str.startswith('"') and tags_str.endswith('"'):
                 tags_str = tags_str[1:-1]
             
