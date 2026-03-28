@@ -117,7 +117,7 @@ async def send_news_dms():
             if not user_data.get("subscribed"):
                 continue
 
-            stories_to_send = new_stories[:3]
+            stories_to_send = new_stories[:20]
 
             if stories_to_send:
                 try:
