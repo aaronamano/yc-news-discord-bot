@@ -90,13 +90,15 @@ Before deploying to production, always run:
 
 ```
 yc-news-discord-bot/
-├── bot.py              # Main bot implementation
-├── requirements.txt    # Python dependencies
-├── .env               # Environment variables (create from template)
-├── setup.sh           # Initial environment setup
-├── dev.sh             # Development commands and checks
-├── run_dev.py         # Development runner with tracing
-└── venv/              # Python virtual environment
+├── bot.py                 # Main bot implementation
+├── redis_cache.py         # Redis caching layer with memory fallback
+├── supabase_client.py     # Supabase client with circuit breaker & rate limiter
+├── requirements.txt       # Python dependencies
+├── .env                   # Environment variables (create from template)
+├── setup.sh               # Initial environment setup
+├── dev.sh                 # Development commands and checks
+├── run_dev.py             # Development runner with tracing
+└── venv/                  # Python virtual environment
 ```
 
 ## Deployment Workflow

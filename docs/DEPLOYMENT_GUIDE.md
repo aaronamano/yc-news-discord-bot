@@ -15,10 +15,13 @@ This guide covers deploying the optimized bot on Render.
 
 ```
 yc-news-discord-bot/
-├── bot.py              # Discord bot (consolidated functionality)
-├── requirements.txt     # Dependencies
-├── .env               # Environment variables
-└── start.sh           # Simplified startup script
+├── bot.py                 # Main Discord bot
+├── redis_cache.py         # Redis caching layer with memory fallback
+├── supabase_client.py     # Supabase client with circuit breaker & rate limiter
+├── requirements.txt      # Dependencies
+├── .env                   # Environment variables
+├── start.sh              # Startup script
+└── venv/                 # Python virtual environment
 ```
 
 ---
@@ -36,6 +39,9 @@ CHANNEL_ID=your_discord_channel_id
 # Database Configuration  
 SUPABASE_URL=your_supabase_url
 SUPABASE_KEY=your_supabase_key
+
+# Redis Configuration (optional - memory fallback available)
+REDIS_URL=redis://localhost:6379
 ```
 
 ### Security Notes:
@@ -84,9 +90,6 @@ chmod +x start.sh
 |---------|-------------|---------|
 | `!yc-news subscribe` | Subscribe to news updates | `!yc-news subscribe` |
 | `!yc-news unsubscribe` | Unsubscribe from updates | `!yc-news unsubscribe` |
-| `!yc-news add="tags"` | Add keywords for matching | `!yc-news add="AI, ML"` |
-| `!yc-news remove="tags"` | Remove keywords | `!yc-news remove="AI, ML"` |
-| `!yc-news tags` | View current keywords | `!yc-news tags` |
 
 ---
 

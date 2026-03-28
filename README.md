@@ -1,6 +1,6 @@
 # YC News Discord Bot
 
-A Discord bot that fetches and delivers personalized Hacker News updates every hour based on user preferences and tags.
+A Discord bot that fetches and delivers Hacker News updates every 6 hours to subscribed users.
 
 ## Quick Start
 
@@ -33,20 +33,16 @@ A Discord bot that fetches and delivers personalized Hacker News updates every h
 
 ## Features
 
-- **Personalized News**: Users can subscribe and receive curated Hacker News stories based on their interests
-- **Tag-Based Filtering**: Add/remove tags to customize the news feed (AI, ML, startups, etc.)
-- **Hourly Updates**: Automatically fetches and delivers the top 15 most recent stories every hour
+- **Automated News Delivery**: Users receive the latest Hacker News stories every 6 hours
 - **DM Delivery**: News is sent directly to users via Discord direct messages
-- **Rate Limiting**: Limits to 5 stories per user per hour to prevent spam
+- **Rate Limiting**: Limits to 3 stories per user per cycle to prevent spam
 
 ## How It Works
 
-The bot scrapes Hacker News via Algolia's API every hour and delivers personalized content to subscribed users:
+The bot scrapes Hacker News via Algolia's API every 6 hours and delivers stories to subscribed users:
 
 1. **Subscription Management**: Users subscribe/unsubscribe via bot commands
-2. **Tag Customization**: Users can add/remove tags to personalize their feed
-3. **Content Filtering**: Tags are added as query parameters to filter stories
-4. **Automated Delivery**: Top stories are delivered via DM every hour
+2. **Automated Delivery**: Top 3 stories are delivered via DM every 6 hours
 
 ## Usage
 
@@ -56,24 +52,14 @@ Run these commands in the specified Discord channel (configured via `CHANNEL_ID`
 
 | Command | Description |
 |---------|-------------|
-| `!yc-news subscribe` | Subscribe to hourly news updates via DM |
+| `!yc-news subscribe` | Subscribe to news updates via DM |
 | `!yc-news unsubscribe` | Unsubscribe from news updates |
-| `!yc-news add="tag1, tag2"` | Add comma-separated tags to personalize feed |
-| `!yc-news remove="tag1, tag2"` | Remove specific tags from your feed |
-| `!yc-news tags` | View all your current tags |
-
-**Examples:**
-```bash
-!yc-news add="AI, ML, LLMs"
-!yc-news remove="AI, SWE"
-```
 
 ## Project Structure
 
 ```
 yc-news-discord-bot/
 ├── bot.py                 # Main bot implementation
-├── subscriptions.db       # SQLite database for user subscriptions and tags (auto-created)
 ├── .env                   # Environment variables (DISCORD_TOKEN, CHANNEL_ID)
 ├── .env.example           # Example environment file
 ├── requirements.txt       # Python dependencies
@@ -83,17 +69,16 @@ yc-news-discord-bot/
 ## Technical Details
 
 - **Data Source**: [Hacker News via Algolia API](https://hn.algolia.com/?dateRange=last24h&page=0&prefix=true&sort=byDate&type=story)
-- **Scraping Frequency**: Every hour
-- **Story Limit**: Top 15 most recent stories, 5 delivered per user
-- **Storage**: SQLite database for subscriptions and user preferences
-- **Rate Limiting**: Built-in spam protection (5 stories/user/hour)
+- **Scraping Frequency**: Every 6 hours
+- **Story Limit**: Top 3 stories delivered per user
+- **Storage**: Supabase database for subscriptions
+- **Rate Limiting**: Built-in spam protection (3 stories/user/cycle)
 
 ## Database Schema
 
 ```sql
 CREATE TABLE subscriptions (
     userId TEXT PRIMARY KEY,
-    subscribed BOOLEAN DEFAULT FALSE,
-    tags TEXT DEFAULT '[]'
+    subscribed BOOLEAN DEFAULT FALSE
 )
 ```

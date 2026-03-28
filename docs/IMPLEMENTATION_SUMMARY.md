@@ -10,9 +10,11 @@ I've successfully optimized the YC News bot to prevent 429 errors by removing ex
 - **`services.py`** - Business logic moved to bot.py
 - **`api_server.py`** - FastAPI server removed to eliminate 429-causing queries
 
-### Consolidated Files:
-- **`bot.py`** - Now contains all essential functionality with optimized database operations
-- **`start.sh`** - Simplified to run only the Discord bot
+### Current Files:
+- **`bot.py`** - Main Discord bot with command handlers
+- **`redis_cache.py`** - Redis caching layer with memory fallback
+- **`supabase_client.py`** - Supabase client with circuit breaker & rate limiter
+- **`start.sh`** - Startup script
 
 ## 🚀 Current Functionality
 
@@ -20,9 +22,6 @@ I've successfully optimized the YC News bot to prevent 429 errors by removing ex
 |---------|--------|-------------|
 | `!yc-news subscribe` | ✅ Working | Subscribe user to news updates |
 | `!yc-news unsubscribe` | ✅ Working | Unsubscribe user from updates |
-| `!yc-news add="tags"` | ✅ Working | Add keywords for news matching |
-| `!yc-news remove="tags"` | ✅ Working | Remove keywords from subscription |
-| `!yc-news tags` | ✅ Working | View current subscribed tags |
 | News DM Delivery | ✅ Optimized | Reduced frequency to prevent 429 errors |
 
 ## 🛠️ Optimizations Applied
@@ -58,10 +57,7 @@ python bot.py
 ### 2. Discord Commands:
 ```
 !yc-news subscribe              # Subscribe to news updates
-!yc-news unsubscribe            # Unsubscribe from updates  
-!yc-news add="AI, ML"          # Add keywords for matching
-!yc-news remove="AI, ML"       # Remove keywords
-!yc-news tags                   # View current keywords
+!yc-news unsubscribe            # Unsubscribe from updates
 ```
 
 ## 🎯 Benefits Over Previous Implementation

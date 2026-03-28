@@ -29,10 +29,11 @@
 
 ## 🔧 NEW CACHING FEATURES
 
-### **Redis Integration**
+### **Redis Integration (redis_cache.py)**
 - Primary caching layer with Redis for performance
 - Memory fallback when Redis unavailable
 - Connection error handling and graceful degradation
+- Separate module for clean separation of concerns
 
 ### **Enhanced Cache TTL Strategy**
 ```python
