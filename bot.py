@@ -1,45 +1,44 @@
 import os
 import asyncio
-import requests
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
-from bs4 import BeautifulSoup
 import time
 import random
+import requests
 
 from redis_cache import (
     init_redis,
-    get_cached_data,
-    set_cached_data,
     delete_cached_user_data,
     cleanup_expired_cache,
     get_cache_stats,
     cache_lock,
     user_cache,
-    cache_expiry
+    cache_expiry,
 )
 
-from supabase_client import (
-    load_subscriptions,
-    subscribe_user,
-    unsubscribe_user
+from supabase_client import load_subscriptions, subscribe_user, unsubscribe_user
+
+from rate_limiter import (
+    exponential_backoff,
+    wait_for_rate_limit,
+    dm_cooldowns,
+    MAX_RETRIES,
 )
 
-from supabase_client import (
-    get_supabase,
-    load_subscriptions,
-    subscribe_user,
-    unsubscribe_user
+from metadata_cache import (
+    get_cached_timezone_names,
+    get_cached_extension_info,
+    get_cached_function_metadata,
 )
+
+from hn_scraper import fetch_hn_stories, debug_hn_scraping
 
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-HN_URL = "https://news.ycombinator.com"
-
 if not DISCORD_TOKEN or not CHANNEL_ID:
     exit(1)
 
@@ -52,294 +51,9 @@ intents.messages = True
 intents.dm_messages = True
 client = discord.Client(intents=intents)
 
-BASE_RETRY_DELAY = 2
-MAX_RETRY_DELAY = 300
-MAX_RETRIES = 5
-API_RATE_LIMIT = 45
-DM_RATE_LIMIT = 5
-
-
-def exponential_backoff(attempt: int) -> int:
-    delay = min(BASE_RETRY_DELAY * (2**attempt), MAX_RETRY_DELAY)
-    jitter = random.uniform(0.1, 0.5) * delay
-    return int(delay + jitter)
-
-
-async def rate_limit_check(operation_type: str = "api") -> bool:
-    global last_api_request, dm_cooldowns
-
-    current_time = time.time()
-
-    if operation_type == "api":
-        last_minute_requests = [
-            t for t in last_api_request.get("api", []) if current_time - t < 60
-        ]
-        if len(last_minute_requests) >= API_RATE_LIMIT:
-            return False
-
-        if "api" not in last_api_request:
-            last_api_request["api"] = []
-        last_api_request["api"].append(current_time)
-        last_api_request["api"] = [
-            t for t in last_api_request["api"] if current_time - t < 60
-        ]
-
-    elif operation_type == "dm":
-        if len(dm_cooldowns) >= DM_RATE_LIMIT:
-            return False
-
-    return True
-
-
-async def wait_for_rate_limit(operation_type: str = "api"):
-    while not await rate_limit_check(operation_type):
-        if operation_type == "api":
-            await asyncio.sleep(1.5)
-        else:
-            await asyncio.sleep(0.6)
-
-
 posted_ids = set()
-last_api_request = {}
-dm_cooldowns = {}
 connection_attempts = 0
 last_connection_attempt = 0
-
-
-def fetch_hn_stories():
-    try:
-        response = requests.get(HN_URL, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        stories = []
-        story_rows = soup.select("tr.athing")[:20]
-
-        for row in story_rows:
-            story_id = row.get("id")
-            title_link = row.select_one("span.titleline a")
-
-            if not title_link:
-                continue
-
-            title = title_link.text.strip()
-            url = title_link.get("href", "")
-            hn_link = f"https://news.ycombinator.com/item?id={story_id}"
-
-            subtext = row.find_next_sibling("tr").select_one("td.subtext")
-            age = subtext.select_one("span.age").text if subtext else "unknown"
-
-            stories.append(
-                {
-                    "id": story_id,
-                    "title": title,
-                    "url": url,
-                    "hn_link": hn_link,
-                    "age": age,
-                }
-            )
-
-        return stories
-    except Exception:
-        return []
-
-
-async def debug_hn_scraping():
-    debug_info = {"status": "starting", "steps": {}, "errors": [], "sample_stories": []}
-
-    try:
-        debug_info["steps"]["network"] = "testing"
-        try:
-            response = requests.get(HN_URL, timeout=10)
-            response.raise_for_status()
-            debug_info["steps"]["network"] = (
-                f"success ({len(response.content)} bytes received)"
-            )
-            debug_info["steps"]["status_code"] = response.status_code
-        except Exception as e:
-            debug_info["steps"]["network"] = f"failed: {str(e)}"
-            debug_info["errors"].append(f"Network error: {str(e)}")
-            return debug_info
-
-        debug_info["steps"]["parsing"] = "testing"
-        try:
-            soup = BeautifulSoup(response.text, "html.parser")
-            debug_info["steps"]["parsing"] = "success"
-        except Exception as e:
-            debug_info["steps"]["parsing"] = f"failed: {str(e)}"
-            debug_info["errors"].append(f"HTML parsing error: {str(e)}")
-            return debug_info
-
-        debug_info["steps"]["selectors"] = {}
-        story_rows = soup.select("tr.athing")
-        debug_info["steps"]["selectors"]["tr.athing"] = f"found {len(story_rows)} rows"
-
-        alt_story_rows = soup.select("tr.athing.submission")
-        debug_info["steps"]["selectors"]["tr.athing.submission"] = (
-            f"found {len(alt_story_rows)} rows"
-        )
-
-        if len(story_rows) == 0:
-            debug_info["errors"].append("No story rows found with main selector")
-            if len(alt_story_rows) > 0:
-                story_rows = alt_story_rows
-                debug_info["steps"]["analysis"] = (
-                    "Using alternative selector (tr.athing.submission)"
-                )
-
-        debug_info["steps"]["parsing_analysis"] = {
-            "total_rows": len(story_rows),
-            "limited_to": min(20, len(story_rows)),
-        }
-
-        parsed_count = 0
-        failed_count = 0
-        failure_reasons = {}
-
-        for i, row in enumerate(story_rows[:5]):
-            story_debug = {"index": i, "steps": {}}
-
-            story_id = row.get("id")
-            story_debug["steps"]["id"] = story_id if story_id else "MISSING"
-
-            title_link = row.select_one("span.titleline a")
-            if title_link:
-                story_debug["steps"]["title_link"] = "found"
-                story_debug["title"] = (
-                    title_link.text.strip()[:50] + "..."
-                    if len(title_link.text.strip()) > 50
-                    else title_link.text.strip()
-                )
-                story_debug["url"] = (
-                    title_link.get("href", "")[:50] + "..."
-                    if len(title_link.get("href", "")) > 50
-                    else title_link.get("href", "")
-                )
-            else:
-                story_debug["steps"]["title_link"] = "MISSING"
-                failure_reasons["title_link_missing"] = (
-                    failure_reasons.get("title_link_missing", 0) + 1
-                )
-                failed_count += 1
-                debug_info["sample_stories"].append(story_debug)
-                continue
-
-            subtext = row.find_next_sibling("tr").select_one("td.subtext")
-            if subtext:
-                age_element = subtext.select_one("span.age")
-                if age_element:
-                    story_debug["steps"]["age"] = age_element.text
-                else:
-                    story_debug["steps"]["age"] = "MISSING"
-                    failure_reasons["age_missing"] = (
-                        failure_reasons.get("age_missing", 0) + 1
-                    )
-            else:
-                story_debug["steps"]["subtext"] = "MISSING"
-                failure_reasons["subtext_missing"] = (
-                    failure_reasons.get("subtext_missing", 0) + 1
-                )
-
-            debug_info["sample_stories"].append(story_debug)
-
-            if title_link:
-                parsed_count += 1
-
-        debug_info["steps"]["parsing_results"] = {
-            "parsed_count": parsed_count,
-            "failed_count": failed_count,
-            "failure_reasons": failure_reasons,
-        }
-
-        final_stories = fetch_hn_stories()
-        debug_info["steps"]["final_result"] = (
-            f"fetch_hn_stories() returned {len(final_stories)} stories"
-        )
-
-        debug_info["status"] = "completed"
-        return debug_info
-
-    except Exception as e:
-        debug_info["status"] = f"failed: {str(e)}"
-        debug_info["errors"].append(f"General error: {str(e)}")
-        return debug_info
-
-
-async def get_cached_timezone_names():
-    cache_key = "pg_timezone_names"
-    cached = get_cached_data(cache_key, "timezone_names")
-    if cached is not None:
-        return cached
-
-    common_timezones = [
-        "UTC",
-        "US/Eastern",
-        "US/Central",
-        "US/Mountain",
-        "US/Pacific",
-        "Europe/London",
-        "Europe/Paris",
-        "Europe/Berlin",
-        "Europe/Moscow",
-        "Asia/Tokyo",
-        "Asia/Shanghai",
-        "Asia/Dubai",
-        "Asia/Kolkata",
-        "Australia/Sydney",
-        "Pacific/Auckland",
-    ]
-
-    set_cached_data(cache_key, common_timezones, "timezone_names")
-    return common_timezones
-
-
-async def get_cached_extension_info():
-    cache_key = "pg_extension_info"
-    cached = get_cached_data(cache_key, "extension_info")
-    if cached is not None:
-        return cached
-
-    extension_info = [
-        {"name": "uuid-ossp", "schema": "public", "installed_version": "1.1.2"},
-        {
-            "name": "pg_stat_statements",
-            "schema": "pg_catalog",
-            "installed_version": "1.10",
-        },
-        {"name": "pg_cron", "schema": "public", "installed_version": "1.5.0"},
-        {"name": "pgcrypto", "schema": "public", "installed_version": "1.3.2"},
-    ]
-
-    set_cached_data(cache_key, extension_info, "extension_info")
-    return extension_info
-
-
-async def get_cached_function_metadata():
-    cache_key = "pg_function_metadata"
-    cached = get_cached_data(cache_key, "function_metadata")
-    if cached is not None:
-        return cached
-
-    function_metadata = {
-        "public_functions": [
-            {
-                "schema": "public",
-                "name": "get_user_subscriptions",
-                "return_type": "table",
-            },
-            {
-                "schema": "public",
-                "name": "update_subscription",
-                "return_type": "boolean",
-            },
-            {"schema": "public", "name": "send_news_dms", "return_type": "void"},
-        ],
-        "total_count": 3,
-        "last_updated": time.time(),
-    }
-
-    set_cached_data(cache_key, function_metadata, "function_metadata")
-    return function_metadata
 
 
 async def send_dm_to_user(user, story):
@@ -379,7 +93,7 @@ async def send_dm_to_user(user, story):
         return False
 
 
-@tasks.loop(hours=6)
+@tasks.loop(hours=20)
 async def send_news_dms():
     try:
         subscriptions = await load_subscriptions()
