@@ -2,6 +2,7 @@ import os
 import discord
 from discord.ext import tasks
 from dotenv import load_dotenv
+import asyncio
 from hn_scraper import fetch_hn_stories
 
 load_dotenv()
